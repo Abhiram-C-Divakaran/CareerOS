@@ -1,7 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
 import { listTimelineEvents } from "@/lib/db";
+import { requireAuthenticatedSession } from "@/lib/security";
+import { validateApplicationStatus } from "@/lib/validation";
 
 export async function GET(req: NextRequest) {
+  const { errorResponse } = requireAuthenticatedSession(req);
+  if (errorResponse) return errorResponse;
+
   const { searchParams } = new URL(req.url);
   const applicationId = searchParams.get("applicationId") || undefined;
   const source = searchParams.get("source") || undefined;
@@ -10,6 +15,17 @@ export async function GET(req: NextRequest) {
   const fromDate = searchParams.get("fromDate") || undefined;
   const toDate = searchParams.get("toDate") || undefined;
   const exportFormat = searchParams.get("export");
+
+  if (status && status !== "ALL") {
+    try {
+      validateApplicationStatus(status);
+    } catch (err) {
+      return NextResponse.json(
+        { error: err instanceof Error ? err.message : "Invalid status filter" },
+        { status: 400 }
+      );
+    }
+  }
 
   const events = listTimelineEvents({
     applicationId,
@@ -68,14 +84,17 @@ export async function GET(req: NextRequest) {
   }
 
   if (exportFormat === "json") {
-    return new NextResponse(JSON.stringify({ immutableTimeline: events }, null, 2), {
-      headers: {
-        "Content-Type": "application/json; charset=utf-8",
-        "Content-Disposition": `attachment; filename="careeros-immutable-history-${new Date()
-          .toISOString()
-          .slice(0, 10)}.json"`,
-      },
-    });
+    return new NextResponse(
+      JSON.stringify({ immutableTimeline: events }, null, 2),
+      {
+        headers: {
+          "Content-Type": "application/json; charset=utf-8",
+          "Content-Disposition": `attachment; filename="careeros-immutable-history-${new Date()
+            .toISOString()
+            .slice(0, 10)}.json"`,
+        },
+      }
+    );
   }
 
   return NextResponse.json({

@@ -7,6 +7,7 @@ export interface RawEmailInput {
   sender: string;
   receivedAt: string;
   bodyText: string;
+  isSample?: boolean;
 }
 
 export interface ParsedJobEmail {

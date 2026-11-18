@@ -1,4 +1,4 @@
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import {
   getLatestDailyBriefing,
   getOAuthIntegrationStatus,
@@ -7,8 +7,12 @@ import {
   listSyncedEmails,
   listTimelineEvents,
 } from "@/lib/db";
+import { requireAuthenticatedSession } from "@/lib/security";
 
-export async function GET() {
+export async function GET(req: NextRequest) {
+  const { errorResponse } = requireAuthenticatedSession(req);
+  if (errorResponse) return errorResponse;
+
   const applications = listApplications();
   const interviews = listInterviews(true);
   const timeline = listTimelineEvents();

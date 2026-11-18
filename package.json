@@ -8,7 +8,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "tsc --noEmit",
-    "test": "node --no-warnings --test tests/*.test.ts",
+    "test": "node --no-warnings --import ./tests/register-loader.mjs --test tests/*.test.ts",
     "sync:cron": "node --no-warnings scripts/daily-cron.ts"
   },
   "dependencies": {

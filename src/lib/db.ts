@@ -15,7 +15,12 @@ import type {
   SyncedEmailRecord,
 } from "./types.ts";
 import { parseJobEmail, type RawEmailInput } from "./email-parser.ts";
-import { decryptSecret, encryptSecret } from "./security.ts";
+import {
+  decryptSecret,
+  encryptSecret,
+  hashApiToken,
+  hashPassword,
+} from "./security.ts";
 
 // Load Node 24's built-in node:sqlite via process.getBuiltinModule
 const { DatabaseSync } = process.getBuiltinModule("node:sqlite") as unknown as {
@@ -93,6 +98,7 @@ function initializeSchema(db: SqliteDb): void {
       recruiter_email TEXT,
       notes TEXT,
       priority TEXT NOT NULL DEFAULT 'MEDIUM',
+      is_sample INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
@@ -149,6 +155,7 @@ function initializeSchema(db: SqliteDb): void {
       reminder_dismissed INTEGER NOT NULL DEFAULT 0,
       status TEXT NOT NULL DEFAULT 'UPCOMING',
       source TEXT NOT NULL DEFAULT 'MANUAL',
+      is_sample INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL
     );
 
@@ -170,6 +177,7 @@ function initializeSchema(db: SqliteDb): void {
       mapped_status TEXT NOT NULL,
       application_id TEXT,
       is_duplicate INTEGER NOT NULL DEFAULT 0,
+      is_sample INTEGER NOT NULL DEFAULT 0,
       processed_at TEXT NOT NULL
     );
 
@@ -194,8 +202,11 @@ function initializeSchema(db: SqliteDb): void {
       encrypted_refresh_token TEXT,
       scopes_json TEXT NOT NULL,
       token_expires_at TEXT,
+      token_status TEXT NOT NULL DEFAULT 'VALID',
       last_gmail_sync_at TEXT,
       last_calendar_sync_at TEXT,
+      last_sync_error TEXT,
+      last_sync_error_at TEXT,
       updated_at TEXT NOT NULL
     );
 
@@ -204,6 +215,40 @@ function initializeSchema(db: SqliteDb): void {
       value TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
+  `);
+
+  // Safe migrations for existing databases
+  const safeAlter = [
+    `ALTER TABLE applications ADD COLUMN is_sample INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE interviews ADD COLUMN is_sample INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE synced_emails ADD COLUMN is_sample INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE oauth_tokens ADD COLUMN token_status TEXT NOT NULL DEFAULT 'VALID'`,
+    `ALTER TABLE oauth_tokens ADD COLUMN last_sync_error TEXT`,
+    `ALTER TABLE oauth_tokens ADD COLUMN last_sync_error_at TEXT`,
+  ];
+  for (const stmt of safeAlter) {
+    try {
+      db.exec(stmt);
+    } catch {
+      // Column already exists
+    }
+  }
+
+  // Isolate known legacy sample data rows so they are never confused with real personal applications
+  db.exec(`
+    UPDATE applications SET is_sample = 1
+    WHERE portal_application_id IN (
+      'AMZN-REQ-2849103', 'CT20264891203', 'INFY-SP-551920', 'WPR-TURBO-88412',
+      'ACN-WD-993011', 'LNKD-STR-44201', 'NKR-FK-77123', 'IND-ATL-11029', 'RZP-FE-90412'
+    );
+    UPDATE interviews SET is_sample = 1
+    WHERE calendar_event_id IN ('cal_amzn_sde1_loop1', 'cal_infy_sp_panel')
+       OR application_id IN (SELECT id FROM applications WHERE is_sample = 1);
+    UPDATE synced_emails SET is_sample = 1
+    WHERE gmail_message_id IN (
+      'msg_amzn_001', 'msg_tcs_002', 'msg_acn_003',
+      'msg_sim_wipro_interview_2026', 'msg_sim_razorpay_confirm_2026'
+    ) OR application_id IN (SELECT id FROM applications WHERE is_sample = 1);
   `);
 }
 
@@ -227,6 +272,7 @@ function mapRowToApplication(row: Record<string, unknown>): JobApplication {
     recruiterEmail: row.recruiter_email ? String(row.recruiter_email) : null,
     notes: row.notes ? String(row.notes) : null,
     priority: (row.priority as PriorityLevel) || "MEDIUM",
+    isSample: Boolean(row.is_sample),
     createdAt: String(row.created_at),
     updatedAt: String(row.updated_at),
   };
@@ -372,22 +418,36 @@ function normalizeRole(role: string): string {
     .trim();
 }
 
+function shouldIncludeSampleData(explicitFlag?: boolean): boolean {
+  if (explicitFlag !== undefined) return explicitFlag;
+  return process.env.CAREEROS_ENABLE_SAMPLE_DATA === "true";
+}
+
 export function findExistingApplication(
   db: SqliteDb,
   params: {
     portalApplicationId?: string | null;
     company: string;
     role: string;
+    includeSample?: boolean;
   }
 ): JobApplication | null {
+  const sampleClause = shouldIncludeSampleData(params.includeSample)
+    ? ""
+    : " AND is_sample = 0";
+
   if (params.portalApplicationId) {
     const byPortalId = db
-      .prepare(`SELECT * FROM applications WHERE UPPER(portal_application_id) = UPPER(?) LIMIT 1`)
+      .prepare(
+        `SELECT * FROM applications WHERE UPPER(portal_application_id) = UPPER(?)${sampleClause} LIMIT 1`
+      )
       .get(params.portalApplicationId.trim());
     if (byPortalId) return mapRowToApplication(byPortalId);
   }
 
-  const allRows = db.prepare(`SELECT * FROM applications`).all();
+  const allRows = db
+    .prepare(`SELECT * FROM applications WHERE 1=1${sampleClause}`)
+    .all();
   const targetComp = normalizeCompany(params.company);
   const targetRole = normalizeRole(params.role);
 
@@ -414,10 +474,15 @@ export function listApplications(filters?: {
   status?: string;
   portal?: string;
   search?: string;
+  includeSample?: boolean;
 }): JobApplication[] {
   const db = getDb();
   let sql = `SELECT * FROM applications WHERE 1=1`;
   const params: unknown[] = [];
+
+  if (!shouldIncludeSampleData(filters?.includeSample)) {
+    sql += ` AND is_sample = 0`;
+  }
 
   if (filters?.status && filters.status !== "ALL") {
     sql += ` AND status = ?`;
@@ -463,12 +528,14 @@ export function createOrDeduplicateApplication(input: {
   priority?: PriorityLevel;
   source?: EventSource;
   externalReferenceId?: string | null;
+  isSample?: boolean;
 }): { application: JobApplication; deduplicated: boolean } {
   const db = getDb();
   const existing = findExistingApplication(db, {
     portalApplicationId: input.portalApplicationId,
     company: input.company,
     role: input.role,
+    includeSample: input.isSample,
   });
 
   const now = new Date().toISOString();
@@ -539,8 +606,8 @@ export function createOrDeduplicateApplication(input: {
     `INSERT INTO applications (
       id, company, role, portal, portal_application_id, source_url, location, work_mode,
       compensation, status, applied_date, last_activity_date, assessment_deadline,
-      follow_up_date, next_interview_at, recruiter_email, notes, priority, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      follow_up_date, next_interview_at, recruiter_email, notes, priority, is_sample, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(
     id,
     input.company.trim(),
@@ -560,6 +627,7 @@ export function createOrDeduplicateApplication(input: {
     input.recruiterEmail?.trim() || null,
     input.notes?.trim() || null,
     input.priority || "MEDIUM",
+    input.isSample ? 1 : 0,
     now,
     now
   );
@@ -703,10 +771,15 @@ export function listTimelineEvents(filters?: {
   search?: string;
   fromDate?: string;
   toDate?: string;
+  includeSample?: boolean;
 }): ApplicationTimelineEvent[] {
   const db = getDb();
   let sql = `SELECT * FROM application_timeline_events WHERE 1=1`;
   const params: unknown[] = [];
+
+  if (!shouldIncludeSampleData(filters?.includeSample)) {
+    sql += ` AND application_id NOT IN (SELECT id FROM applications WHERE is_sample = 1)`;
+  }
 
   if (filters?.applicationId) {
     sql += ` AND application_id = ?`;
@@ -738,11 +811,17 @@ export function listTimelineEvents(filters?: {
   return db.prepare(sql).all(...params).map(mapRowToTimelineEvent);
 }
 
-export function listInterviews(includeCompleted = true): InterviewEvent[] {
+export function listInterviews(
+  includeCompleted = true,
+  includeSample?: boolean
+): InterviewEvent[] {
   const db = getDb();
+  const sampleFilter = shouldIncludeSampleData(includeSample)
+    ? ""
+    : " AND is_sample = 0";
   const sql = includeCompleted
-    ? `SELECT * FROM interviews ORDER BY scheduled_start ASC`
-    : `SELECT * FROM interviews WHERE status = 'UPCOMING' ORDER BY scheduled_start ASC`;
+    ? `SELECT * FROM interviews WHERE 1=1${sampleFilter} ORDER BY scheduled_start ASC`
+    : `SELECT * FROM interviews WHERE status = 'UPCOMING'${sampleFilter} ORDER BY scheduled_start ASC`;
   return db.prepare(sql).all().map(mapRowToInterview);
 }
 
@@ -872,6 +951,7 @@ export function ingestEmailMessage(raw: RawEmailInput): {
     portalApplicationId: parsed.applicationId,
     company: parsed.company,
     role: parsed.role,
+    includeSample: raw.isSample,
   });
 
   let targetApp: JobApplication;
@@ -955,6 +1035,7 @@ export function ingestEmailMessage(raw: RawEmailInput): {
           : "MEDIUM",
       source: "GMAIL_SYNC",
       externalReferenceId: raw.messageId,
+      isSample: raw.isSample,
     });
     targetApp = createdRes.application;
     deduplicatedApplication = createdRes.deduplicated;
@@ -983,8 +1064,8 @@ export function ingestEmailMessage(raw: RawEmailInput): {
     `INSERT INTO synced_emails (
       id, gmail_message_id, thread_id, subject, sender, received_at, snippet,
       detected_company, detected_role, detected_portal, detected_application_id,
-      classification, mapped_status, application_id, is_duplicate, processed_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      classification, mapped_status, application_id, is_duplicate, is_sample, processed_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(
     emailRecordId,
     raw.messageId,
@@ -1001,6 +1082,7 @@ export function ingestEmailMessage(raw: RawEmailInput): {
     parsed.mappedStatus,
     targetApp.id,
     deduplicatedApplication ? 1 : 0,
+    raw.isSample ? 1 : 0,
     now
   );
 
@@ -1016,10 +1098,15 @@ export function ingestEmailMessage(raw: RawEmailInput): {
   };
 }
 
-export function listSyncedEmails(): SyncedEmailRecord[] {
+export function listSyncedEmails(includeSample?: boolean): SyncedEmailRecord[] {
   const db = getDb();
+  const sampleFilter = shouldIncludeSampleData(includeSample)
+    ? ""
+    : " WHERE is_sample = 0";
   return db
-    .prepare(`SELECT * FROM synced_emails ORDER BY received_at DESC LIMIT 100`)
+    .prepare(
+      `SELECT * FROM synced_emails${sampleFilter} ORDER BY received_at DESC LIMIT 100`
+    )
     .all()
     .map(mapRowToSyncedEmail);
 }
@@ -1044,14 +1131,17 @@ export function saveEncryptedOAuthToken(params: {
   db.prepare(
     `INSERT INTO oauth_tokens (
       provider, account_email, encrypted_access_token, encrypted_refresh_token,
-      scopes_json, token_expires_at, updated_at
-    ) VALUES ('google', ?, ?, ?, ?, ?, ?)
+      scopes_json, token_expires_at, token_status, last_sync_error, last_sync_error_at, updated_at
+    ) VALUES ('google', ?, ?, ?, ?, ?, 'VALID', NULL, NULL, ?)
     ON CONFLICT(provider) DO UPDATE SET
       account_email = excluded.account_email,
       encrypted_access_token = excluded.encrypted_access_token,
       encrypted_refresh_token = COALESCE(excluded.encrypted_refresh_token, oauth_tokens.encrypted_refresh_token),
       scopes_json = excluded.scopes_json,
       token_expires_at = excluded.token_expires_at,
+      token_status = 'VALID',
+      last_sync_error = NULL,
+      last_sync_error_at = NULL,
       updated_at = excluded.updated_at`
   ).run(
     params.accountEmail,
@@ -1068,6 +1158,9 @@ export function getDecryptedGoogleTokens(): {
   accessToken: string;
   refreshToken: string | null;
   tokenExpiresAt: string | null;
+  tokenStatus: "VALID" | "EXPIRED" | "REVOKED" | "DISCONNECTED";
+  lastGmailSyncAt: string | null;
+  lastCalendarSyncAt: string | null;
 } | null {
   const db = getDb();
   const row = db
@@ -1082,6 +1175,14 @@ export function getDecryptedGoogleTokens(): {
       ? decryptSecret(String(row.encrypted_refresh_token))
       : null,
     tokenExpiresAt: row.token_expires_at ? String(row.token_expires_at) : null,
+    tokenStatus:
+      (row.token_status as "VALID" | "EXPIRED" | "REVOKED") || "VALID",
+    lastGmailSyncAt: row.last_gmail_sync_at
+      ? String(row.last_gmail_sync_at)
+      : null,
+    lastCalendarSyncAt: row.last_calendar_sync_at
+      ? String(row.last_calendar_sync_at)
+      : null,
   };
 }
 
@@ -1099,6 +1200,7 @@ export function getOAuthIntegrationStatus(): OAuthIntegrationStatus {
     return {
       provider: "google",
       connected: false,
+      tokenStatus: "DISCONNECTED",
       accountEmail: null,
       scopes: [
         "https://www.googleapis.com/auth/gmail.readonly",
@@ -1107,36 +1209,120 @@ export function getOAuthIntegrationStatus(): OAuthIntegrationStatus {
       hasClientCredentials,
       lastGmailSyncAt: null,
       lastCalendarSyncAt: null,
+      lastSyncError: null,
+      lastSyncErrorAt: null,
       tokenExpiresAt: null,
-      encryptionAlgorithm: "AES-256-GCM (node:crypto scrypt + 96-bit IV + 128-bit AuthTag)",
+      encryptionAlgorithm:
+        "AES-256-GCM (node:crypto scrypt + 96-bit IV + 128-bit AuthTag)",
     };
   }
 
+  const rawStatus =
+    (row.token_status as OAuthIntegrationStatus["tokenStatus"]) || "VALID";
+  const isExpired =
+    rawStatus === "VALID" &&
+    row.token_expires_at &&
+    new Date(String(row.token_expires_at)).getTime() <= Date.now() &&
+    !row.encrypted_refresh_token;
+
+  const effectiveStatus: OAuthIntegrationStatus["tokenStatus"] = isExpired
+    ? "EXPIRED"
+    : rawStatus;
+
   return {
     provider: "google",
-    connected: true,
+    connected: effectiveStatus === "VALID" || effectiveStatus === "EXPIRED",
+    tokenStatus: effectiveStatus,
     accountEmail: row.account_email ? String(row.account_email) : null,
     scopes: JSON.parse(String(row.scopes_json || "[]")),
     hasClientCredentials,
-    lastGmailSyncAt: row.last_gmail_sync_at ? String(row.last_gmail_sync_at) : null,
-    lastCalendarSyncAt: row.last_calendar_sync_at ? String(row.last_calendar_sync_at) : null,
+    lastGmailSyncAt: row.last_gmail_sync_at
+      ? String(row.last_gmail_sync_at)
+      : null,
+    lastCalendarSyncAt: row.last_calendar_sync_at
+      ? String(row.last_calendar_sync_at)
+      : null,
+    lastSyncError: row.last_sync_error ? String(row.last_sync_error) : null,
+    lastSyncErrorAt: row.last_sync_error_at
+      ? String(row.last_sync_error_at)
+      : null,
     tokenExpiresAt: row.token_expires_at ? String(row.token_expires_at) : null,
-    encryptionAlgorithm: "AES-256-GCM (node:crypto scrypt + 96-bit IV + 128-bit AuthTag)",
+    encryptionAlgorithm:
+      "AES-256-GCM (node:crypto scrypt + 96-bit IV + 128-bit AuthTag)",
   };
 }
 
 export function recordSyncTimestamp(channel: "gmail" | "calendar"): void {
   const db = getDb();
   const now = new Date().toISOString();
-  const col = channel === "gmail" ? "last_gmail_sync_at" : "last_calendar_sync_at";
-  db.prepare(`UPDATE oauth_tokens SET ${col} = ?, updated_at = ? WHERE provider = 'google'`).run(
-    now,
-    now
-  );
+  const col =
+    channel === "gmail" ? "last_gmail_sync_at" : "last_calendar_sync_at";
+  db.prepare(
+    `UPDATE oauth_tokens SET ${col} = ?, last_sync_error = NULL, last_sync_error_at = NULL, updated_at = ? WHERE provider = 'google'`
+  ).run(now, now);
   db.prepare(
     `INSERT INTO system_settings (key, value, updated_at) VALUES (?, ?, ?)
      ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
   ).run(`last_${channel}_sync`, now, now);
+}
+
+export function recordOAuthSyncError(
+  errorMessage: string,
+  newTokenStatus?: "EXPIRED" | "REVOKED"
+): void {
+  const db = getDb();
+  const now = new Date().toISOString();
+  if (newTokenStatus) {
+    db.prepare(
+      `UPDATE oauth_tokens SET token_status = ?, last_sync_error = ?, last_sync_error_at = ?, updated_at = ? WHERE provider = 'google'`
+    ).run(newTokenStatus, errorMessage.slice(0, 500), now, now);
+  } else {
+    db.prepare(
+      `UPDATE oauth_tokens SET last_sync_error = ?, last_sync_error_at = ?, updated_at = ? WHERE provider = 'google'`
+    ).run(errorMessage.slice(0, 500), now, now);
+  }
+}
+
+export function getMasterPasswordHash(): string | null {
+  const db = getDb();
+  const row = db
+    .prepare(
+      `SELECT value FROM system_settings WHERE key = 'master_password_hash'`
+    )
+    .get();
+  return row ? String(row.value) : null;
+}
+
+export function setMasterPasswordHash(rawPassword: string): void {
+  const db = getDb();
+  const now = new Date().toISOString();
+  const hashed = hashPassword(rawPassword);
+  db.prepare(
+    `INSERT INTO system_settings (key, value, updated_at) VALUES ('master_password_hash', ?, ?)
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
+  ).run(hashed, now);
+}
+
+export function getExtensionTokenHash(): string | null {
+  const db = getDb();
+  const row = db
+    .prepare(
+      `SELECT value FROM system_settings WHERE key = 'extension_api_token_hash'`
+    )
+    .get();
+  return row ? String(row.value) : null;
+}
+
+export function rotateExtensionApiToken(): string {
+  const db = getDb();
+  const now = new Date().toISOString();
+  const rawToken = `cos_ext_${crypto.randomBytes(24).toString("hex")}`;
+  const tokenHash = hashApiToken(rawToken);
+  db.prepare(
+    `INSERT INTO system_settings (key, value, updated_at) VALUES ('extension_api_token_hash', ?, ?)
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
+  ).run(tokenHash, now);
+  return rawToken;
 }
 
 export function generateDailyBriefing(): DailyBriefing {
@@ -1348,6 +1534,9 @@ export function getLatestDailyBriefing(): DailyBriefing {
 }
 
 function seedInitialDataIfEmpty(db: SqliteDb): void {
+  if (process.env.CAREEROS_ENABLE_SAMPLE_DATA !== "true") {
+    return;
+  }
   const countRow = db.prepare(`SELECT COUNT(*) as cnt FROM applications`).get();
   const count = Number(countRow?.cnt ?? 0);
   if (count > 0) return;
@@ -1575,4 +1764,11 @@ function seedInitialDataIfEmpty(db: SqliteDb): void {
     accenture.id,
     daysAgo(1)
   );
+
+  // Mark all seeded rows as isolated sample data
+  db.exec(`
+    UPDATE applications SET is_sample = 1;
+    UPDATE interviews SET is_sample = 1;
+    UPDATE synced_emails SET is_sample = 1;
+  `);
 }

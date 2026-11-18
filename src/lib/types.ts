@@ -48,6 +48,7 @@ export interface JobApplication {
   recruiterEmail: string | null;
   notes: string | null;
   priority: PriorityLevel;
+  isSample?: boolean;
   createdAt: string;
   updatedAt: string;
 }
@@ -165,11 +166,14 @@ export interface DailyBriefing {
 export interface OAuthIntegrationStatus {
   provider: "google";
   connected: boolean;
+  tokenStatus: "VALID" | "EXPIRED" | "REVOKED" | "DISCONNECTED";
   accountEmail: string | null;
   scopes: string[];
   hasClientCredentials: boolean;
   lastGmailSyncAt: string | null;
   lastCalendarSyncAt: string | null;
+  lastSyncError: string | null;
+  lastSyncErrorAt: string | null;
   tokenExpiresAt: string | null;
   encryptionAlgorithm: string;
 }
