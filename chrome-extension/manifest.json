@@ -1,0 +1,29 @@
+{
+  "manifest_version": 3,
+  "name": "CareerOS Portal Companion",
+  "version": "1.0.0",
+  "description": "User-authorized career portal clipper for CareerOS. Captures job applications, Application IDs, and statuses from Amazon Careers, TCS NextStep, Wipro, Infosys, Accenture, LinkedIn, Indeed, and Naukri without bypassing authentication or CAPTCHAs.",
+  "permissions": ["activeTab", "storage", "scripting"],
+  "host_permissions": ["http://localhost:3000/*"],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Capture Job Application to CareerOS"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://*.amazon.jobs/*",
+        "https://nextstep.tcs.com/*",
+        "https://*.wipro.com/*",
+        "https://*.infosys.com/*",
+        "https://*.accenture.com/*",
+        "https://*.myworkdayjobs.com/*",
+        "https://*.linkedin.com/jobs/*",
+        "https://*.indeed.com/*",
+        "https://*.naukri.com/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
