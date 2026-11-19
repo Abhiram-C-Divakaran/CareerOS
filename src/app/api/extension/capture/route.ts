@@ -1,52 +1,114 @@
 import { NextRequest, NextResponse } from "next/server";
-import { createOrDeduplicateApplication } from "@/lib/db";
+import {
+  createOrDeduplicateApplication,
+  getDb,
+  getExtensionTokenHash,
+} from "@/lib/db";
 import { detectPortalFromText, extractApplicationId } from "@/lib/email-parser";
-import { ApplicationPortal, ApplicationStatus } from "@/lib/types";
+import {
+  getExtensionCorsHeaders,
+  isOriginAllowedForExtension,
+  requireAuthenticatedSession,
+  verifyApiToken,
+} from "@/lib/security";
+import {
+  safeParseJsonBody,
+  validateApplicationPortal,
+  validateApplicationStatus,
+  validateOptionalString,
+  validateRequiredString,
+  validateSafeHttpUrl,
+  ValidationError,
+} from "@/lib/validation";
 
-const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, Authorization, X-CareerOS-Source",
-};
-
-export async function OPTIONS() {
+export async function OPTIONS(req: NextRequest) {
+  const corsHeaders = getExtensionCorsHeaders(req);
+  if (!isOriginAllowedForExtension(req)) {
+    return new NextResponse(null, { status: 403, headers: corsHeaders });
+  }
   return new NextResponse(null, { status: 204, headers: corsHeaders });
 }
 
 export async function POST(req: NextRequest) {
+  getDb();
+  const corsHeaders = getExtensionCorsHeaders(req);
+
+  if (!isOriginAllowedForExtension(req)) {
+    return NextResponse.json(
+      { error: "Origin not allowed for Chrome Extension capture API." },
+      { status: 403, headers: corsHeaders }
+    );
+  }
+
+  // Authenticate via either Extension API Token OR active browser session + CSRF check
+  const extHeaderToken =
+    req.headers.get("x-careeros-extension-token") ||
+    (req.headers.get("authorization")?.startsWith("Bearer ")
+      ? req.headers.get("authorization")!.slice(7)
+      : null);
+
+  if (extHeaderToken !== null) {
+    const storedExtHash = getExtensionTokenHash();
+    if (!verifyApiToken(extHeaderToken, storedExtHash)) {
+      return NextResponse.json(
+        { error: "Invalid Chrome Extension API token." },
+        { status: 401, headers: corsHeaders }
+      );
+    }
+  } else {
+    const { errorResponse } = requireAuthenticatedSession(req);
+    if (errorResponse) {
+      return NextResponse.json(
+        {
+          error:
+            "Unauthorized extension capture request. Provide a valid X-CareerOS-Extension-Token or authenticated session.",
+        },
+        { status: errorResponse.status, headers: corsHeaders }
+      );
+    }
+  }
+
   try {
-    const body = (await req.json()) as {
-      company?: string;
-      role?: string;
-      portal?: ApplicationPortal;
-      portalApplicationId?: string | null;
-      sourceUrl?: string | null;
-      location?: string | null;
-      status?: ApplicationStatus;
-      pageTextSnippet?: string;
-      notes?: string;
-    };
+    const body = await safeParseJsonBody(req);
+
+    const pageTextSnippet =
+      validateOptionalString(body.pageTextSnippet, "pageTextSnippet", 6000) ||
+      "";
+    const sourceUrl = validateSafeHttpUrl(body.sourceUrl, "sourceUrl");
 
     const detected = detectPortalFromText(
       "",
-      `${body.company || ""} ${body.role || ""}`,
-      body.pageTextSnippet || "",
-      body.sourceUrl || ""
+      `${String(body.company || "")} ${String(body.role || "")}`,
+      pageTextSnippet,
+      sourceUrl || ""
     );
 
-    const company = (
-      body.company ||
-      detected.defaultCompany ||
-      "Career Portal Employer"
-    ).trim();
-    const role = (body.role || "Software Engineer").trim();
-    const portal = body.portal || detected.portal;
+    const company = validateRequiredString(
+      body.company || detected.defaultCompany,
+      "company",
+      140
+    );
+    const role = validateRequiredString(body.role, "role", 160);
+    const portal = body.portal
+      ? validateApplicationPortal(body.portal)
+      : detected.portal;
+    const status = body.status
+      ? validateApplicationStatus(body.status)
+      : "APPLIED";
+    const location =
+      validateOptionalString(body.location, "location", 120) ||
+      "Bengaluru, India";
+    const notes = validateOptionalString(body.notes, "notes", 2000);
+
+    const explicitPortalId = validateOptionalString(
+      body.portalApplicationId,
+      "portalApplicationId",
+      80
+    );
     const portalApplicationId =
-      body.portalApplicationId ||
+      explicitPortalId ||
       extractApplicationId(
-        `${body.portalApplicationId || ""} ${body.sourceUrl || ""} ${
-          body.pageTextSnippet || ""
-        }`
+        `${explicitPortalId || ""} ${sourceUrl || ""} ${pageTextSnippet}`
       );
 
     const result = createOrDeduplicateApplication({
@@ -54,13 +116,13 @@ export async function POST(req: NextRequest) {
       role,
       portal,
       portalApplicationId,
-      sourceUrl: body.sourceUrl || null,
-      location: body.location || "Bengaluru, India",
-      status: body.status || "APPLIED",
+      sourceUrl,
+      location,
+      status,
       notes:
-        body.notes ||
+        notes ||
         `Captured via user-authorized CareerOS Chrome Extension from ${
-          body.sourceUrl || portal
+          sourceUrl || portal
         }.`,
       source: "CHROME_EXTENSION",
     });
@@ -74,6 +136,12 @@ export async function POST(req: NextRequest) {
       { status: result.deduplicated ? 200 : 201, headers: corsHeaders }
     );
   } catch (err) {
+    if (err instanceof ValidationError) {
+      return NextResponse.json(
+        { error: err.message },
+        { status: 400, headers: corsHeaders }
+      );
+    }
     return NextResponse.json(
       {
         error:

@@ -7,6 +7,7 @@ export interface RawEmailInput {
   sender: string;
   receivedAt: string;
   bodyText: string;
+  isSample?: boolean;
 }
 
 export interface ParsedJobEmail {
@@ -152,7 +153,7 @@ export function extractCompanyName(
 ): string {
   if (defaultCompany) return defaultCompany;
 
-  // LinkedIn: "Your application was sent to Stripe" / "Abhiram, your application was sent to Microsoft"
+  // LinkedIn: "Your application was sent to Stripe" / "Candidate, your application was sent to Microsoft"
   const linkedInSent = subject.match(
     /application\s+(?:was\s+sent\s+to|to)\s+([A-Z][A-Za-z0-9\s&.-]{1,40}?)(?:\s+for\s+|\s*[-|!]|$)/i
   );

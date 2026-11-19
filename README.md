@@ -39,6 +39,15 @@ A single-user, AI-powered career management web application built with **Next.js
    - Responsive layout with desktop sidebar and mobile bottom navigation bar
    - Web App Manifest (`/manifest.webmanifest`) and Service Worker (`/sw.js`) for home-screen installation and notifications
 
+## Security Architecture & Hardening
+
+- **Server-Side Session Authentication**: Every private API route (`/api/dashboard`, `/api/applications`, `/api/history`, `/api/interviews`, `/api/briefing`, `/api/integrations/google`, `/api/integrations/google/callback`, `/api/extension/capture`) enforces server-side session verification (`requireAuthenticatedSession`) and returns `HTTP 401 Unauthorized` when unauthenticated without exposing or mutating data.
+- **No Hardcoded Passwords or Secrets**: All fallback passwords and static cryptographic secrets have been removed. Master passwords are stored as salted `scrypt` hashes in SQLite (or read from `CAREEROS_MASTER_PASSWORD`), and `AES-256-GCM` / `HMAC-SHA256` keys are read from environment variables or generated via `crypto.randomBytes(32)` into a local gitignored key file (`data/.careeros-secrets.json` with `0600` permissions).
+- **CSRF Protection**: State-changing endpoints (`POST`, `PATCH`, `DELETE`) verify both same-origin (`Origin` / `Referer`) and session-bound `X-CareerOS-CSRF` tokens derived via `HMAC-SHA256(session.jti)`.
+- **Session-Bound OAuth State**: Google OAuth initiation generates an expiring, `HMAC-SHA256` signed `state` token bound to the active browser session's `jti` and a short-lived `httpOnly` nonce cookie (`careeros_oauth_state`, 10-minute TTL), validated before exchanging any OAuth authorization code.
+- **Token-Secured Chrome Extension API**: `/api/extension/capture` rejects wildcard CORS (`*`) and requires a valid `X-CareerOS-Extension-Token` (stored as a `SHA-256` hash in SQLite and verified with `crypto.timingSafeEqual`) or an authenticated session.
+- **Sample Data Isolation**: Sample demo data is disabled by default (`CAREEROS_ENABLE_SAMPLE_DATA=false`) and isolated via `is_sample = 1` so personal databases remain strictly free of sample records.
+
 ---
 
 ## Account Setup for Live Google OAuth (Gmail & Calendar)

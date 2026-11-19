@@ -1,4 +1,5 @@
 document.addEventListener("DOMContentLoaded", async () => {
+  const apiTokenEl = document.getElementById("apiToken");
   const companyEl = document.getElementById("company");
   const roleEl = document.getElementById("role");
   const portalEl = document.getElementById("portal");
@@ -7,6 +8,25 @@ document.addEventListener("DOMContentLoaded", async () => {
   const sourceUrlEl = document.getElementById("sourceUrl");
   const statusMsg = document.getElementById("statusMsg");
   const captureBtn = document.getElementById("captureBtn");
+
+  try {
+    const stored = await chrome.storage.local.get(["careerosExtensionToken"]);
+    if (stored && stored.careerosExtensionToken) {
+      apiTokenEl.value = stored.careerosExtensionToken;
+    }
+  } catch {
+    // ignore outside extension runtime
+  }
+
+  apiTokenEl.addEventListener("change", () => {
+    try {
+      chrome.storage.local.set({
+        careerosExtensionToken: apiTokenEl.value.trim(),
+      });
+    } catch {
+      // ignore
+    }
+  });
 
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -37,13 +57,24 @@ document.addEventListener("DOMContentLoaded", async () => {
   }
 
   captureBtn.addEventListener("click", async () => {
+    const token = apiTokenEl.value.trim();
+    if (!token) {
+      statusMsg.style.color = "#f87171";
+      statusMsg.textContent =
+        "Please enter your Extension API Token from CareerOS Security Vault.";
+      return;
+    }
+
     statusMsg.style.color = "#94a3b8";
     statusMsg.textContent = "Syncing with CareerOS...";
 
     try {
       const res = await fetch("http://localhost:3000/api/extension/capture", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "X-CareerOS-Extension-Token": token,
+        },
         body: JSON.stringify({
           company: companyEl.value.trim(),
           role: roleEl.value.trim(),

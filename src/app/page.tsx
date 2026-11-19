@@ -112,7 +112,7 @@ const EMAIL_PRESETS = [
     subject:
       "Online Assessment Invitation: Software Development Engineer I at Amazon (Job ID: AMZN-REQ-2849103)",
     bodyText:
-      "Hello Abhiram, Thank you for applying to Amazon for Software Development Engineer I (Requisition ID: AMZN-REQ-2849103). Please complete your HackerRank Online Assessment before deadline: 2026-11-22.",
+      "Hello Candidate, Thank you for applying to Amazon for Software Development Engineer I (Requisition ID: AMZN-REQ-2849103). Please complete your HackerRank Online Assessment before deadline: 2026-11-22.",
   },
   {
     label: "TCS NextStep Interview Invite",
@@ -130,14 +130,14 @@ const EMAIL_PRESETS = [
     subject:
       "Congratulations! Offer of Employment for Specialist Programmer at Infosys (Application ID: INFY-SP-551920)",
     bodyText:
-      "Dear Abhiram, Congratulations! We are pleased to extend an offer of employment for the role of Specialist Programmer (SP L2) at Infosys (Application ID: INFY-SP-551920).",
+      "Dear Candidate, Congratulations! We are pleased to extend an offer of employment for the role of Specialist Programmer (SP L2) at Infosys (Application ID: INFY-SP-551920).",
   },
   {
     label: "New LinkedIn Application (Microsoft)",
     messageId: "msg_preset_msft_apply_2026",
     sender: "LinkedIn Jobs <jobs-noreply@linkedin.com>",
     subject:
-      "Abhiram, your application was sent to Microsoft for Software Engineer II",
+      "Candidate, your application was sent to Microsoft for Software Engineer II",
     bodyText:
       "Your application was sent to Microsoft for the role of Software Engineer II (Application ID: MSFT-AZ-774190). Good luck!",
   },
@@ -211,10 +211,13 @@ export default function CareerOSApp() {
 
   // Single-User Auth State
   const [isSessionAuthenticated, setIsSessionAuthenticated] = useState(false);
-  const [isLocked, setIsLocked] = useState(false);
-  const [masterPasswordInput, setMasterPasswordInput] = useState(
-    "careeros-admin-2026"
-  );
+  const [passwordConfigured, setPasswordConfigured] = useState(true);
+  const [csrfToken, setCsrfToken] = useState<string>("");
+  const [generatedExtensionToken, setGeneratedExtensionToken] = useState<
+    string | null
+  >(null);
+  const [isLocked, setIsLocked] = useState(true);
+  const [masterPasswordInput, setMasterPasswordInput] = useState("");
 
   const showNotificationBanner = useCallback(
     (text: string, type: "success" | "info" | "error" = "success") => {
@@ -226,9 +229,25 @@ export default function CareerOSApp() {
     []
   );
 
+  const getMutationHeaders = useCallback((): Record<string, string> => {
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+    };
+    if (csrfToken) {
+      headers["X-CareerOS-CSRF"] = csrfToken;
+    }
+    return headers;
+  }, [csrfToken]);
+
   const fetchDashboard = useCallback(async () => {
     try {
       const res = await fetch("/api/dashboard", { cache: "no-store" });
+      if (res.status === 401) {
+        setIsSessionAuthenticated(false);
+        setIsLocked(true);
+        setLoading(false);
+        return;
+      }
       if (!res.ok) throw new Error("Failed to load CareerOS dashboard");
       const json = (await res.json()) as DashboardPayload;
       setData(json);
@@ -243,13 +262,24 @@ export default function CareerOSApp() {
   }, [showNotificationBanner]);
 
   useEffect(() => {
-    fetchDashboard();
-    fetch("/api/auth")
+    fetch("/api/auth", { cache: "no-store" })
       .then((r) => r.json())
       .then((d) => {
-        if (d.authenticated) setIsSessionAuthenticated(true);
+        setPasswordConfigured(Boolean(d.passwordConfigured));
+        if (d.authenticated) {
+          setIsSessionAuthenticated(true);
+          setCsrfToken(d.csrfToken || "");
+          setIsLocked(false);
+          fetchDashboard();
+        } else {
+          setIsSessionAuthenticated(false);
+          setIsLocked(true);
+          setLoading(false);
+        }
       })
-      .catch(() => {});
+      .catch(() => {
+        setLoading(false);
+      });
 
     if (typeof window !== "undefined") {
       if ("Notification" in window) {
@@ -263,12 +293,12 @@ export default function CareerOSApp() {
 
   // Periodic background synchronization polling
   useEffect(() => {
-    if (!periodicSyncEnabled) return;
+    if (!periodicSyncEnabled || !isSessionAuthenticated || isLocked) return;
     const timer = setInterval(() => {
       fetchDashboard();
     }, 60_000);
     return () => clearInterval(timer);
-  }, [periodicSyncEnabled, fetchDashboard]);
+  }, [periodicSyncEnabled, isSessionAuthenticated, isLocked, fetchDashboard]);
 
   const filteredApplications = useMemo(() => {
     if (!data) return [];
@@ -326,7 +356,7 @@ export default function CareerOSApp() {
     try {
       const res = await fetch("/api/applications", {
         method: "PATCH",
-        headers: { "Content-Type": "application/json" },
+        headers: getMutationHeaders(),
         body: JSON.stringify({
           id: applicationId,
           status: newStatus,
@@ -357,7 +387,7 @@ export default function CareerOSApp() {
 
       const res = await fetch(endpoint, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: getMutationHeaders(),
         body: JSON.stringify({
           ...newAppForm,
           portalApplicationId: newAppForm.portalApplicationId || null,
@@ -406,7 +436,7 @@ export default function CareerOSApp() {
     try {
       const res = await fetch("/api/interviews", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: getMutationHeaders(),
         body: JSON.stringify({
           ...newInterviewForm,
           scheduledStart: new Date(
@@ -435,7 +465,7 @@ export default function CareerOSApp() {
     try {
       const res = await fetch("/api/integrations/google", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: getMutationHeaders(),
         body: JSON.stringify({
           action: "ingest_raw_email",
           rawEmail: rawEmailForm,
@@ -445,16 +475,21 @@ export default function CareerOSApp() {
       if (!res.ok) throw new Error(json.error || "Failed to parse email");
       await fetchDashboard();
       const r = json.result;
-      if (r.deduplicatedMessage) {
+      if (r.skippedNonJob) {
+        showNotificationBanner(
+          "Email did not match job application signals and was skipped.",
+          "info"
+        );
+      } else if (r.deduplicatedMessage) {
         showNotificationBanner(
           `Duplicate Gmail Message ID (${rawEmailForm.messageId}) skipped — zero duplicate records created!`,
           "info"
         );
-      } else if (r.deduplicatedApplication) {
+      } else if (r.deduplicatedApplication && r.record) {
         showNotificationBanner(
           `Matched existing ${r.record.detectedCompany} application & advanced status to ${r.record.mappedStatus}!`
         );
-      } else {
+      } else if (r.record) {
         showNotificationBanner(
           `Created new ${r.record.detectedCompany} application (${r.record.mappedStatus}) from email!`
         );
@@ -471,14 +506,14 @@ export default function CareerOSApp() {
     try {
       const res = await fetch("/api/integrations/google", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: getMutationHeaders(),
         body: JSON.stringify({ action: "simulate_sync" }),
       });
       const json = await res.json();
       if (!res.ok) throw new Error(json.error || "Batch sync failed");
       await fetchDashboard();
       showNotificationBanner(
-        `Synced ${json.processedCount} emails (${json.deduplicatedMessages} duplicate messages skipped, ${json.deduplicatedApplications} linked to existing apps).`
+        `Synced ${json.processedCount} sample emails (${json.deduplicatedMessages} duplicate messages skipped, ${json.deduplicatedApplications} linked to existing apps).`
       );
     } catch (err) {
       showNotificationBanner(
@@ -492,7 +527,7 @@ export default function CareerOSApp() {
     try {
       const res = await fetch("/api/integrations/google", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: getMutationHeaders(),
         body: JSON.stringify({ action }),
       });
       const json = await res.json();
@@ -500,7 +535,7 @@ export default function CareerOSApp() {
       await fetchDashboard();
       showNotificationBanner(
         action === "sync_gmail"
-          ? `Gmail API sync complete (${json.processedCount} messages processed).`
+          ? `Gmail API sync complete (${json.processedCount} messages processed across ${json.pagesFetched || 1} page(s)).`
           : `Google Calendar sync complete (${json.interviewsSynced} interviews imported).`
       );
     } catch (err) {
@@ -511,9 +546,34 @@ export default function CareerOSApp() {
     }
   }
 
+  async function handleConnectGoogleOAuth() {
+    try {
+      const res = await fetch("/api/integrations/google", { cache: "no-store" });
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.error || "Could not initiate OAuth");
+      if (json.oauthUrlInfo?.configured && json.oauthUrlInfo?.url) {
+        window.location.href = json.oauthUrlInfo.url;
+      } else {
+        showNotificationBanner(
+          json.oauthUrlInfo?.setupInstructions ||
+            "Configure GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in .env.local first.",
+          "info"
+        );
+      }
+    } catch (err) {
+      showNotificationBanner(
+        err instanceof Error ? err.message : "OAuth initiation error",
+        "error"
+      );
+    }
+  }
+
   async function handleRegenerateBriefing() {
     try {
-      const res = await fetch("/api/briefing", { method: "POST" });
+      const res = await fetch("/api/briefing", {
+        method: "POST",
+        headers: getMutationHeaders(),
+      });
       if (!res.ok) throw new Error("Failed to regenerate briefing");
       await fetchDashboard();
       showNotificationBanner("Daily AI Career Briefing updated!");
@@ -559,21 +619,29 @@ export default function CareerOSApp() {
   async function handleLogin(e: React.FormEvent) {
     e.preventDefault();
     try {
+      const action = passwordConfigured ? "login" : "setup";
       const res = await fetch("/api/auth", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          action: "login",
+          action,
           password: masterPasswordInput,
         }),
       });
       const json = await res.json();
-      if (!res.ok) throw new Error(json.error || "Invalid master password");
+      if (!res.ok) throw new Error(json.error || "Authentication failed");
       setIsSessionAuthenticated(true);
+      setPasswordConfigured(true);
+      setCsrfToken(json.csrfToken || "");
+      setMasterPasswordInput("");
       setIsLocked(false);
       setShowSecurityModal(false);
+      setLoading(true);
+      await fetchDashboard();
       showNotificationBanner(
-        "Single-user HMAC-SHA256 session authenticated & unlocked!"
+        action === "setup"
+          ? "Master password configured & single-user session unlocked!"
+          : "Single-user HMAC-SHA256 session authenticated & unlocked!"
       );
     } catch (err) {
       showNotificationBanner(
@@ -583,7 +651,44 @@ export default function CareerOSApp() {
     }
   }
 
-  if (loading || !data) {
+  async function handleLogoutAndLock() {
+    try {
+      await fetch("/api/auth", {
+        method: "POST",
+        headers: getMutationHeaders(),
+        body: JSON.stringify({ action: "logout" }),
+      });
+    } catch {
+      // Proceed to lock UI
+    }
+    setIsSessionAuthenticated(false);
+    setCsrfToken("");
+    setData(null);
+    setIsLocked(true);
+  }
+
+  async function handleRotateExtensionToken() {
+    try {
+      const res = await fetch("/api/auth", {
+        method: "POST",
+        headers: getMutationHeaders(),
+        body: JSON.stringify({ action: "rotate_extension_token" }),
+      });
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.error || "Failed to generate token");
+      setGeneratedExtensionToken(json.extensionToken);
+      showNotificationBanner(
+        "Generated new Chrome Extension API Token! Copy it below."
+      );
+    } catch (err) {
+      showNotificationBanner(
+        err instanceof Error ? err.message : "Token generation failed",
+        "error"
+      );
+    }
+  }
+
+  if (loading) {
     return (
       <div className="flex min-h-screen items-center justify-center bg-[#070b14] text-slate-200">
         <div className="flex flex-col items-center gap-3">
@@ -596,7 +701,7 @@ export default function CareerOSApp() {
     );
   }
 
-  if (isLocked) {
+  if (isLocked || !data) {
     return (
       <div className="flex min-h-screen items-center justify-center bg-[#070b14] p-4 text-slate-100">
         <div className="w-full max-w-md rounded-2xl border border-slate-800 bg-slate-900/90 p-6 shadow-2xl">
@@ -605,7 +710,11 @@ export default function CareerOSApp() {
               <Lock className="h-6 w-6" />
             </div>
             <div>
-              <h1 className="text-lg font-bold">CareerOS Vault Locked</h1>
+              <h1 className="text-lg font-bold">
+                {passwordConfigured
+                  ? "CareerOS Vault Locked"
+                  : "Initialize CareerOS Master Password"}
+              </h1>
               <p className="text-xs text-slate-400">
                 Single-User Personal Career Command Center
               </p>
@@ -614,24 +723,37 @@ export default function CareerOSApp() {
           <form onSubmit={handleLogin} className="space-y-4">
             <div>
               <label className="mb-1 block text-xs font-medium uppercase tracking-wider text-slate-400">
-                Master Password
+                {passwordConfigured
+                  ? "Master Password"
+                  : "Create Master Password (min 8 characters)"}
               </label>
               <input
+                required
+                minLength={8}
                 type="password"
                 value={masterPasswordInput}
                 onChange={(e) => setMasterPasswordInput(e.target.value)}
                 className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2.5 text-sm text-white focus:border-sky-500 focus:outline-none"
-                placeholder="Enter master password..."
+                placeholder={
+                  passwordConfigured
+                    ? "Enter your master password..."
+                    : "Choose a strong master password..."
+                }
               />
               <p className="mt-1.5 text-xs text-slate-500">
-                Default dev master password: <code>careeros-admin-2026</code>
+                {passwordConfigured
+                  ? "Protected by scrypt + HMAC-SHA256 HTTP-only session cookie."
+                  : "Stored locally as a salted scrypt hash in SQLite."}
               </p>
             </div>
             <button
               type="submit"
               className="flex w-full items-center justify-center gap-2 rounded-lg bg-sky-600 px-4 py-2.5 text-sm font-semibold text-white hover:bg-sky-500"
             >
-              <Unlock className="h-4 w-4" /> Unlock CareerOS
+              <Unlock className="h-4 w-4" />{" "}
+              {passwordConfigured
+                ? "Unlock CareerOS"
+                : "Set Password & Unlock"}
             </button>
           </form>
         </div>
@@ -803,7 +925,7 @@ export default function CareerOSApp() {
           </div>
           <div className="flex gap-2">
             <button
-              onClick={() => setIsLocked(true)}
+              onClick={handleLogoutAndLock}
               className="flex flex-1 items-center justify-center gap-1.5 rounded-lg border border-slate-800 bg-slate-900/80 px-3 py-1.5 text-xs font-medium text-slate-300 hover:border-slate-700"
             >
               <Lock className="h-3.5 w-3.5" /> Lock Vault
@@ -982,7 +1104,9 @@ export default function CareerOSApp() {
                     {stats.offersCount}
                   </p>
                   <p className="mt-1 text-[11px] text-emerald-400/80">
-                    Accenture ACN-WD-993011
+                    {stats.offersCount > 0
+                      ? "Active offer(s) recorded"
+                      : "No offers recorded yet"}
                   </p>
                 </div>
 
@@ -1507,20 +1631,23 @@ export default function CareerOSApp() {
               <section className="rounded-2xl border border-slate-800 bg-slate-900/60 p-5">
                 <div className="flex flex-col justify-between gap-4 lg:flex-row lg:items-center">
                   <div className="space-y-1">
-                    <div className="flex items-center gap-2">
+                    <div className="flex flex-wrap items-center gap-2">
                       <h2 className="text-base font-bold text-white">
                         Official Google OAuth 2.0 & Encrypted Token Storage
                       </h2>
                       <span
                         className={`rounded-full px-2.5 py-0.5 text-[10px] font-semibold ${
-                          oauthStatus.connected
+                          oauthStatus.tokenStatus === "VALID"
                             ? "bg-emerald-500/20 text-emerald-300"
+                            : oauthStatus.tokenStatus === "REVOKED" ||
+                              oauthStatus.tokenStatus === "EXPIRED"
+                            ? "bg-rose-500/20 text-rose-300"
                             : "bg-amber-500/20 text-amber-300"
                         }`}
                       >
                         {oauthStatus.connected
-                          ? `Connected (${oauthStatus.accountEmail})`
-                          : "OAuth Ready (Local / Sandbox Mode)"}
+                          ? `${oauthStatus.tokenStatus} (${oauthStatus.accountEmail})`
+                          : `Status: ${oauthStatus.tokenStatus}`}
                       </span>
                     </div>
                     <p className="text-xs text-slate-400">
@@ -1528,14 +1655,48 @@ export default function CareerOSApp() {
                       <code>gmail.readonly</code>,{" "}
                       <code>calendar.events.readonly</code>
                     </p>
+                    <div className="flex flex-wrap gap-4 pt-1 text-[11px] text-slate-400">
+                      <span>
+                        Last Gmail Sync:{" "}
+                        <strong className="text-slate-200">
+                          {oauthStatus.lastGmailSyncAt
+                            ? new Date(
+                                oauthStatus.lastGmailSyncAt
+                              ).toLocaleString()
+                            : "Never"}
+                        </strong>
+                      </span>
+                      <span>
+                        Last Calendar Sync:{" "}
+                        <strong className="text-slate-200">
+                          {oauthStatus.lastCalendarSyncAt
+                            ? new Date(
+                                oauthStatus.lastCalendarSyncAt
+                              ).toLocaleString()
+                            : "Never"}
+                        </strong>
+                      </span>
+                    </div>
+                    {oauthStatus.lastSyncError && (
+                      <p className="pt-1 text-xs text-rose-300">
+                        Last Sync Error: {oauthStatus.lastSyncError}
+                      </p>
+                    )}
                   </div>
 
                   <div className="flex flex-wrap items-center gap-2">
                     <button
+                      onClick={handleConnectGoogleOAuth}
+                      className="flex items-center gap-1.5 rounded-xl border border-sky-500/40 bg-sky-500/15 px-3.5 py-2 text-xs font-semibold text-sky-300 hover:bg-sky-500/25"
+                    >
+                      <ShieldCheck className="h-3.5 w-3.5" /> Connect Google
+                      OAuth
+                    </button>
+                    <button
                       onClick={handleSampleBatchSync}
                       className="flex items-center gap-1.5 rounded-xl border border-emerald-500/40 bg-emerald-500/15 px-3.5 py-2 text-xs font-semibold text-emerald-300 hover:bg-emerald-500/25"
                     >
-                      <RefreshCw className="h-3.5 w-3.5" /> Run Sample Batch Sync
+                      <RefreshCw className="h-3.5 w-3.5" /> Test Email Parser
                     </button>
                     <button
                       onClick={() => handleLiveGoogleSync("sync_gmail")}
@@ -2267,27 +2428,31 @@ export default function CareerOSApp() {
                 <p className="font-semibold text-sky-300">
                   Session Status:{" "}
                   {isSessionAuthenticated
-                    ? "Signed HTTP-Only Cookie Active"
-                    : "Ready to Sign Session Cookie"}
+                    ? "Signed HTTP-Only Cookie + CSRF Token Active"
+                    : "Locked"}
                 </p>
               </div>
-              <form onSubmit={handleLogin} className="space-y-2 pt-1">
-                <label className="block text-slate-400">
-                  Verify Master Password to issue HTTP-Only Session Cookie:
-                </label>
-                <input
-                  type="password"
-                  value={masterPasswordInput}
-                  onChange={(e) => setMasterPasswordInput(e.target.value)}
-                  className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-white"
-                />
+              <div className="rounded-xl border border-slate-800 bg-slate-950 p-3 space-y-2">
+                <p className="font-semibold text-white">
+                  Chrome Extension API Token
+                </p>
+                <p className="text-slate-400">
+                  Generate a scoped token for the CareerOS Portal Companion
+                  extension (stored as SHA-256 hash in SQLite).
+                </p>
                 <button
-                  type="submit"
-                  className="w-full rounded-lg bg-sky-600 py-2 font-semibold text-white hover:bg-sky-500"
+                  type="button"
+                  onClick={handleRotateExtensionToken}
+                  className="w-full rounded-lg border border-sky-500/40 bg-sky-500/15 py-2 font-semibold text-sky-300 hover:bg-sky-500/25"
                 >
-                  Authenticate Single-User Session
+                  Generate / Rotate Extension API Token
                 </button>
-              </form>
+                {generatedExtensionToken && (
+                  <div className="rounded bg-slate-900 p-2 font-mono text-[11px] break-all text-emerald-300">
+                    {generatedExtensionToken}
+                  </div>
+                )}
+              </div>
             </div>
           </div>
         </div>

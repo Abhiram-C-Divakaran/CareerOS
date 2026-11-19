@@ -1,53 +1,93 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createOrUpdateInterview, getDb, listInterviews } from "@/lib/db";
-import { EventSource } from "@/lib/types";
+import { requireAuthenticatedSession } from "@/lib/security";
+import {
+  safeParseJsonBody,
+  validateInterviewStatus,
+  validateOptionalEmail,
+  validateOptionalIsoDate,
+  validateOptionalString,
+  validateRequiredString,
+  validateSafeHttpUrl,
+  ValidationError,
+} from "@/lib/validation";
 
-export async function GET() {
+export async function GET(req: NextRequest) {
+  getDb();
+  const { errorResponse } = requireAuthenticatedSession(req);
+  if (errorResponse) return errorResponse;
+
   const interviews = listInterviews(true);
   return NextResponse.json({ interviews });
 }
 
 export async function POST(req: NextRequest) {
-  try {
-    const body = (await req.json()) as {
-      applicationId?: string | null;
-      company?: string;
-      role?: string;
-      roundName?: string;
-      scheduledStart?: string;
-      scheduledEnd?: string;
-      meetingLink?: string | null;
-      organizerEmail?: string | null;
-      calendarEventId?: string | null;
-      prepNotes?: string | null;
-      reminderMinutesBefore?: number;
-      source?: EventSource;
-    };
+  getDb();
+  const { errorResponse } = requireAuthenticatedSession(req);
+  if (errorResponse) return errorResponse;
 
-    if (!body.company || !body.role || !body.roundName || !body.scheduledStart) {
+  try {
+    const body = await safeParseJsonBody(req);
+
+    const company = validateRequiredString(body.company, "company", 140);
+    const role = validateRequiredString(body.role, "role", 160);
+    const roundName = validateRequiredString(body.roundName, "roundName", 160);
+    const scheduledStart = validateOptionalIsoDate(
+      body.scheduledStart,
+      "scheduledStart"
+    );
+    if (!scheduledStart) {
       return NextResponse.json(
-        { error: "Company, role, roundName, and scheduledStart are required." },
+        { error: "scheduledStart is required and must be a valid ISO date." },
         { status: 400 }
       );
     }
 
+    const scheduledEnd =
+      validateOptionalIsoDate(body.scheduledEnd, "scheduledEnd") || undefined;
+    const meetingLink = validateSafeHttpUrl(body.meetingLink, "meetingLink");
+    const organizerEmail = validateOptionalEmail(
+      body.organizerEmail,
+      "organizerEmail"
+    );
+    const calendarEventId = validateOptionalString(
+      body.calendarEventId,
+      "calendarEventId",
+      160
+    );
+    const prepNotes = validateOptionalString(body.prepNotes, "prepNotes", 2000);
+    const applicationId = validateOptionalString(
+      body.applicationId,
+      "applicationId",
+      80
+    );
+    const reminderMinutesBefore =
+      typeof body.reminderMinutesBefore === "number" &&
+      body.reminderMinutesBefore >= 0 &&
+      body.reminderMinutesBefore <= 10080
+        ? Math.floor(body.reminderMinutesBefore)
+        : 30;
+
     const res = createOrUpdateInterview({
-      applicationId: body.applicationId,
-      company: body.company,
-      role: body.role,
-      roundName: body.roundName,
-      scheduledStart: body.scheduledStart,
-      scheduledEnd: body.scheduledEnd,
-      meetingLink: body.meetingLink,
-      organizerEmail: body.organizerEmail,
-      calendarEventId: body.calendarEventId,
-      prepNotes: body.prepNotes,
-      reminderMinutesBefore: body.reminderMinutesBefore ?? 30,
-      source: body.source || "MANUAL",
+      applicationId,
+      company,
+      role,
+      roundName,
+      scheduledStart,
+      scheduledEnd,
+      meetingLink,
+      organizerEmail,
+      calendarEventId,
+      prepNotes,
+      reminderMinutesBefore,
+      source: "MANUAL",
     });
 
     return NextResponse.json(res, { status: res.created ? 201 : 200 });
   } catch (err) {
+    if (err instanceof ValidationError) {
+      return NextResponse.json({ error: err.message }, { status: 400 });
+    }
     return NextResponse.json(
       { error: err instanceof Error ? err.message : "Failed to save interview" },
       { status: 500 }
@@ -56,25 +96,36 @@ export async function POST(req: NextRequest) {
 }
 
 export async function PATCH(req: NextRequest) {
-  try {
-    const body = (await req.json()) as {
-      id?: string;
-      status?: "UPCOMING" | "COMPLETED" | "CANCELLED";
-      reminderDismissed?: boolean;
-      prepNotes?: string;
-      meetingLink?: string;
-    };
+  getDb();
+  const { errorResponse } = requireAuthenticatedSession(req);
+  if (errorResponse) return errorResponse;
 
-    if (!body.id) {
-      return NextResponse.json({ error: "Interview ID required" }, { status: 400 });
-    }
+  try {
+    const body = await safeParseJsonBody(req);
+    const id = validateRequiredString(body.id, "id", 80);
+
+    const status =
+      body.status !== undefined
+        ? validateInterviewStatus(body.status)
+        : undefined;
+    const prepNotes =
+      body.prepNotes !== undefined
+        ? validateOptionalString(body.prepNotes, "prepNotes", 2000)
+        : undefined;
+    const meetingLink =
+      body.meetingLink !== undefined
+        ? validateSafeHttpUrl(body.meetingLink, "meetingLink")
+        : undefined;
 
     const db = getDb();
     const existing = db
       .prepare(`SELECT * FROM interviews WHERE id = ?`)
-      .get(body.id);
+      .get(id);
     if (!existing) {
-      return NextResponse.json({ error: "Interview not found" }, { status: 404 });
+      return NextResponse.json(
+        { error: "Interview not found" },
+        { status: 404 }
+      );
     }
 
     db.prepare(
@@ -85,21 +136,27 @@ export async function PATCH(req: NextRequest) {
         meeting_link = ?
       WHERE id = ?`
     ).run(
-      body.status ?? existing.status,
+      status ?? existing.status,
       body.reminderDismissed !== undefined
         ? body.reminderDismissed
           ? 1
           : 0
         : existing.reminder_dismissed,
-      body.prepNotes !== undefined ? body.prepNotes : existing.prep_notes,
-      body.meetingLink !== undefined ? body.meetingLink : existing.meeting_link,
-      body.id
+      prepNotes !== undefined ? prepNotes : existing.prep_notes,
+      meetingLink !== undefined ? meetingLink : existing.meeting_link,
+      id
     );
 
     return NextResponse.json({ ok: true });
   } catch (err) {
+    if (err instanceof ValidationError) {
+      return NextResponse.json({ error: err.message }, { status: 400 });
+    }
     return NextResponse.json(
-      { error: err instanceof Error ? err.message : "Failed to update interview" },
+      {
+        error:
+          err instanceof Error ? err.message : "Failed to update interview",
+      },
       { status: 500 }
     );
   }
