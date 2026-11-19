@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import {
+  getDb,
   getLatestDailyBriefing,
   getOAuthIntegrationStatus,
   listApplications,
@@ -10,6 +11,7 @@ import {
 import { requireAuthenticatedSession } from "@/lib/security";
 
 export async function GET(req: NextRequest) {
+  getDb();
   const { errorResponse } = requireAuthenticatedSession(req);
   if (errorResponse) return errorResponse;
 

@@ -2,7 +2,9 @@ import { NextRequest, NextResponse } from "next/server";
 import { createOrUpdateInterview, getDb, listInterviews } from "@/lib/db";
 import { requireAuthenticatedSession } from "@/lib/security";
 import {
+  safeParseJsonBody,
   validateInterviewStatus,
+  validateOptionalEmail,
   validateOptionalIsoDate,
   validateOptionalString,
   validateRequiredString,
@@ -11,6 +13,7 @@ import {
 } from "@/lib/validation";
 
 export async function GET(req: NextRequest) {
+  getDb();
   const { errorResponse } = requireAuthenticatedSession(req);
   if (errorResponse) return errorResponse;
 
@@ -19,11 +22,12 @@ export async function GET(req: NextRequest) {
 }
 
 export async function POST(req: NextRequest) {
+  getDb();
   const { errorResponse } = requireAuthenticatedSession(req);
   if (errorResponse) return errorResponse;
 
   try {
-    const body = (await req.json()) as Record<string, unknown>;
+    const body = await safeParseJsonBody(req);
 
     const company = validateRequiredString(body.company, "company", 140);
     const role = validateRequiredString(body.role, "role", 160);
@@ -42,10 +46,9 @@ export async function POST(req: NextRequest) {
     const scheduledEnd =
       validateOptionalIsoDate(body.scheduledEnd, "scheduledEnd") || undefined;
     const meetingLink = validateSafeHttpUrl(body.meetingLink, "meetingLink");
-    const organizerEmail = validateOptionalString(
+    const organizerEmail = validateOptionalEmail(
       body.organizerEmail,
-      "organizerEmail",
-      160
+      "organizerEmail"
     );
     const calendarEventId = validateOptionalString(
       body.calendarEventId,
@@ -93,11 +96,12 @@ export async function POST(req: NextRequest) {
 }
 
 export async function PATCH(req: NextRequest) {
+  getDb();
   const { errorResponse } = requireAuthenticatedSession(req);
   if (errorResponse) return errorResponse;
 
   try {
-    const body = (await req.json()) as Record<string, unknown>;
+    const body = await safeParseJsonBody(req);
     const id = validateRequiredString(body.id, "id", 80);
 
     const status =

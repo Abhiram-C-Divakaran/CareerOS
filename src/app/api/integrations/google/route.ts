@@ -1,9 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
 import crypto from "node:crypto";
 import {
+  getDb,
   getOAuthIntegrationStatus,
   ingestEmailMessage,
   listSyncedEmails,
+  storeOAuthStateNonce,
 } from "@/lib/db";
 import {
   getGoogleOAuthUrl,
@@ -13,10 +15,12 @@ import {
 } from "@/lib/google-integration";
 import {
   createOAuthStateToken,
+  isSecureCookieContext,
   OAUTH_STATE_COOKIE_NAME,
   requireAuthenticatedSession,
 } from "@/lib/security";
 import {
+  safeParseJsonBody,
   validateOptionalIsoDate,
   validateOptionalString,
   validateRequiredString,
@@ -24,11 +28,16 @@ import {
 } from "@/lib/validation";
 
 export async function GET(req: NextRequest) {
+  getDb();
   const { session, errorResponse } = requireAuthenticatedSession(req);
   if (errorResponse || !session) return errorResponse!;
 
   const status = getOAuthIntegrationStatus();
-  const { stateToken, nonce } = createOAuthStateToken(session.jti, 600);
+  const { stateToken, nonce, expiresAt } = createOAuthStateToken(
+    session.jti,
+    600
+  );
+  storeOAuthStateNonce(nonce, session.jti, expiresAt);
   const oauthUrlInfo = getGoogleOAuthUrl(stateToken);
   const syncedEmails = listSyncedEmails();
 
@@ -41,7 +50,7 @@ export async function GET(req: NextRequest) {
   res.cookies.set(OAUTH_STATE_COOKIE_NAME, nonce, {
     httpOnly: true,
     sameSite: "lax",
-    secure: process.env.NODE_ENV === "production",
+    secure: isSecureCookieContext(req),
     path: "/",
     maxAge: 600,
   });
@@ -50,56 +59,49 @@ export async function GET(req: NextRequest) {
 }
 
 export async function POST(req: NextRequest) {
+  getDb();
   const { errorResponse } = requireAuthenticatedSession(req);
   if (errorResponse) return errorResponse;
 
   try {
-    const body = (await req.json()) as {
-      action?:
-        | "sync_gmail"
-        | "sync_calendar"
-        | "ingest_raw_email"
-        | "simulate_sync";
-      rawEmail?: Record<string, unknown>;
-    };
+    const body = await safeParseJsonBody(req);
+    const action = body.action;
 
-    if (body.action === "sync_gmail") {
+    if (action === "sync_gmail") {
       const res = await syncLiveGmailMessages();
       return NextResponse.json(res);
     }
 
-    if (body.action === "sync_calendar") {
+    if (action === "sync_calendar") {
       const res = await syncLiveGoogleCalendar();
       return NextResponse.json(res);
     }
 
-    if (body.action === "ingest_raw_email") {
-      if (!body.rawEmail || typeof body.rawEmail !== "object") {
+    if (action === "ingest_raw_email") {
+      const rawEmail = body.rawEmail as Record<string, unknown> | undefined;
+      if (!rawEmail || typeof rawEmail !== "object") {
         return NextResponse.json(
           { error: "rawEmail object is required." },
           { status: 400 }
         );
       }
 
-      const subject = validateRequiredString(
-        body.rawEmail.subject,
-        "subject",
-        300
-      );
+      const subject = validateRequiredString(rawEmail.subject, "subject", 300);
       const bodyText = validateRequiredString(
-        body.rawEmail.bodyText,
+        rawEmail.bodyText,
         "bodyText",
         10000
       );
       const sender =
-        validateOptionalString(body.rawEmail.sender, "sender", 200) ||
+        validateOptionalString(rawEmail.sender, "sender", 200) ||
         "careers@company.com";
       const messageId =
-        validateOptionalString(body.rawEmail.messageId, "messageId", 160) ||
+        validateOptionalString(rawEmail.messageId, "messageId", 160) ||
         `msg_manual_${crypto.randomUUID().slice(0, 10)}`;
       const receivedAt =
-        validateOptionalIsoDate(body.rawEmail.receivedAt, "receivedAt") ||
+        validateOptionalIsoDate(rawEmail.receivedAt, "receivedAt") ||
         new Date().toISOString();
+      const isSample = Boolean(rawEmail.isSample);
 
       const result = ingestEmailMessage({
         messageId,
@@ -107,7 +109,7 @@ export async function POST(req: NextRequest) {
         sender,
         receivedAt,
         bodyText,
-        isSample: false,
+        isSample,
       });
 
       return NextResponse.json({
@@ -116,7 +118,7 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    if (body.action === "simulate_sync") {
+    if (action === "simulate_sync") {
       const sampleBatch = getSampleBatchEmails();
       const results = sampleBatch.map((email) => ingestEmailMessage(email));
 

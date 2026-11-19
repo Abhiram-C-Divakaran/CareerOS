@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { consumeOAuthStateNonce, getDb } from "@/lib/db";
 import { exchangeGoogleCodeForTokens } from "@/lib/google-integration";
 import {
   OAUTH_STATE_COOKIE_NAME,
@@ -8,11 +9,15 @@ import {
 } from "@/lib/security";
 
 export async function GET(req: NextRequest) {
+  getDb();
   const sessionToken = req.cookies.get(SESSION_COOKIE_NAME)?.value;
   const session = verifySessionToken(sessionToken);
   if (!session) {
     return NextResponse.json(
-      { error: "Authentication required before completing Google OAuth callback." },
+      {
+        error:
+          "Authentication required before completing Google OAuth callback.",
+      },
       { status: 401 }
     );
   }
@@ -24,12 +29,16 @@ export async function GET(req: NextRequest) {
   const baseUrl = process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000";
 
   const cookieNonce = req.cookies.get(OAUTH_STATE_COOKIE_NAME)?.value;
-  const isStateValid = verifyOAuthStateToken(state, session.jti, cookieNonce);
+  const stateCheck = verifyOAuthStateToken(state, session.jti, cookieNonce);
 
-  if (!isStateValid) {
+  if (
+    !stateCheck.valid ||
+    !stateCheck.nonce ||
+    !consumeOAuthStateNonce(stateCheck.nonce, session.jti)
+  ) {
     const invalidRes = NextResponse.redirect(
       `${baseUrl}/?oauth_error=${encodeURIComponent(
-        "Invalid or expired OAuth state parameter."
+        "Invalid, expired, or already used OAuth state parameter."
       )}`
     );
     invalidRes.cookies.delete(OAUTH_STATE_COOKIE_NAME);
@@ -38,7 +47,9 @@ export async function GET(req: NextRequest) {
 
   if (error) {
     const errRes = NextResponse.redirect(
-      `${baseUrl}/?oauth_error=${encodeURIComponent(error)}`
+      `${baseUrl}/?oauth_error=${encodeURIComponent(
+        error.slice(0, 80)
+      )}`
     );
     errRes.cookies.delete(OAUTH_STATE_COOKIE_NAME);
     return errRes;
@@ -61,10 +72,11 @@ export async function GET(req: NextRequest) {
     );
     okRes.cookies.delete(OAUTH_STATE_COOKIE_NAME);
     return okRes;
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : "OAuth callback failed";
+  } catch {
     const failRes = NextResponse.redirect(
-      `${baseUrl}/?oauth_error=${encodeURIComponent(msg)}`
+      `${baseUrl}/?oauth_error=${encodeURIComponent(
+        "Google OAuth token exchange failed. Check server logs and credentials."
+      )}`
     );
     failRes.cookies.delete(OAUTH_STATE_COOKIE_NAME);
     return failRes;

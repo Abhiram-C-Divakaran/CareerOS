@@ -112,7 +112,7 @@ const EMAIL_PRESETS = [
     subject:
       "Online Assessment Invitation: Software Development Engineer I at Amazon (Job ID: AMZN-REQ-2849103)",
     bodyText:
-      "Hello Abhiram, Thank you for applying to Amazon for Software Development Engineer I (Requisition ID: AMZN-REQ-2849103). Please complete your HackerRank Online Assessment before deadline: 2026-11-22.",
+      "Hello Candidate, Thank you for applying to Amazon for Software Development Engineer I (Requisition ID: AMZN-REQ-2849103). Please complete your HackerRank Online Assessment before deadline: 2026-11-22.",
   },
   {
     label: "TCS NextStep Interview Invite",
@@ -130,14 +130,14 @@ const EMAIL_PRESETS = [
     subject:
       "Congratulations! Offer of Employment for Specialist Programmer at Infosys (Application ID: INFY-SP-551920)",
     bodyText:
-      "Dear Abhiram, Congratulations! We are pleased to extend an offer of employment for the role of Specialist Programmer (SP L2) at Infosys (Application ID: INFY-SP-551920).",
+      "Dear Candidate, Congratulations! We are pleased to extend an offer of employment for the role of Specialist Programmer (SP L2) at Infosys (Application ID: INFY-SP-551920).",
   },
   {
     label: "New LinkedIn Application (Microsoft)",
     messageId: "msg_preset_msft_apply_2026",
     sender: "LinkedIn Jobs <jobs-noreply@linkedin.com>",
     subject:
-      "Abhiram, your application was sent to Microsoft for Software Engineer II",
+      "Candidate, your application was sent to Microsoft for Software Engineer II",
     bodyText:
       "Your application was sent to Microsoft for the role of Software Engineer II (Application ID: MSFT-AZ-774190). Good luck!",
   },
@@ -475,16 +475,21 @@ export default function CareerOSApp() {
       if (!res.ok) throw new Error(json.error || "Failed to parse email");
       await fetchDashboard();
       const r = json.result;
-      if (r.deduplicatedMessage) {
+      if (r.skippedNonJob) {
+        showNotificationBanner(
+          "Email did not match job application signals and was skipped.",
+          "info"
+        );
+      } else if (r.deduplicatedMessage) {
         showNotificationBanner(
           `Duplicate Gmail Message ID (${rawEmailForm.messageId}) skipped — zero duplicate records created!`,
           "info"
         );
-      } else if (r.deduplicatedApplication) {
+      } else if (r.deduplicatedApplication && r.record) {
         showNotificationBanner(
           `Matched existing ${r.record.detectedCompany} application & advanced status to ${r.record.mappedStatus}!`
         );
-      } else {
+      } else if (r.record) {
         showNotificationBanner(
           `Created new ${r.record.detectedCompany} application (${r.record.mappedStatus}) from email!`
         );
@@ -1099,7 +1104,9 @@ export default function CareerOSApp() {
                     {stats.offersCount}
                   </p>
                   <p className="mt-1 text-[11px] text-emerald-400/80">
-                    Accenture ACN-WD-993011
+                    {stats.offersCount > 0
+                      ? "Active offer(s) recorded"
+                      : "No offers recorded yet"}
                   </p>
                 </div>
 

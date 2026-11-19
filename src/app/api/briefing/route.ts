@@ -1,8 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
-import { generateDailyBriefing, getLatestDailyBriefing } from "@/lib/db";
+import { generateDailyBriefing, getDb, getLatestDailyBriefing } from "@/lib/db";
 import { requireAuthenticatedSession } from "@/lib/security";
 
 export async function GET(req: NextRequest) {
+  getDb();
   const { errorResponse } = requireAuthenticatedSession(req);
   if (errorResponse) return errorResponse;
 
@@ -11,6 +12,7 @@ export async function GET(req: NextRequest) {
 }
 
 export async function POST(req: NextRequest) {
+  getDb();
   const { errorResponse } = requireAuthenticatedSession(req);
   if (errorResponse) return errorResponse;
 

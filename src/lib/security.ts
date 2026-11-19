@@ -2,7 +2,6 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import type { NextRequest } from "next/server";
-import { NextResponse } from "next/server";
 
 const ENCRYPTION_ALGORITHM = "aes-256-gcm";
 export const SESSION_COOKIE_NAME = "careeros_session";
@@ -16,7 +15,21 @@ interface LocalRuntimeSecrets {
 
 const globalForSecrets = globalThis as unknown as {
   __careerosRuntimeSecrets?: LocalRuntimeSecrets;
+  __careerosSessionRevokedFn?: (jti: string) => boolean;
+  __careerosLoginAttempts?: Map<string, { count: number; resetAt: number }>;
 };
+
+export function registerSessionRevocationChecker(
+  checker: (jti: string) => boolean
+): void {
+  globalForSecrets.__careerosSessionRevokedFn = checker;
+}
+
+export function isSessionJtiRevoked(jti: string): boolean {
+  return globalForSecrets.__careerosSessionRevokedFn
+    ? globalForSecrets.__careerosSessionRevokedFn(jti)
+    : false;
+}
 
 function getLocalSecretsFilePath(): string {
   const dataDir = path.join(process.cwd(), "data");
@@ -91,30 +104,59 @@ function getOrLoadRuntimeSecrets(): LocalRuntimeSecrets {
   return generated;
 }
 
-function getDerivedEncryptionKey(): Buffer {
+function getEncryptionKeyMaterial(): string {
   const envSecret = process.env.CAREEROS_ENCRYPTION_KEY?.trim();
-  const runtimeSecrets = getOrLoadRuntimeSecrets();
-  const secretMaterial =
-    envSecret && envSecret.length >= 16
-      ? envSecret
-      : runtimeSecrets.encryptionKeyHex;
-  return crypto.scryptSync(secretMaterial, runtimeSecrets.saltHex, 32);
+  if (envSecret !== undefined && envSecret !== "") {
+    if (envSecret.length < 32) {
+      throw new Error(
+        "CAREEROS_ENCRYPTION_KEY must be at least 32 characters long."
+      );
+    }
+    return envSecret;
+  }
+  return getOrLoadRuntimeSecrets().encryptionKeyHex;
 }
 
 function getSessionSigningSecret(): string {
   const envSecret = process.env.CAREEROS_SESSION_SECRET?.trim();
-  if (envSecret && envSecret.length >= 16) {
+  if (envSecret !== undefined && envSecret !== "") {
+    if (envSecret.length < 32) {
+      throw new Error(
+        "CAREEROS_SESSION_SECRET must be at least 32 characters long."
+      );
+    }
     return envSecret;
   }
   return getOrLoadRuntimeSecrets().sessionSecretHex;
 }
 
+function deriveAesKeyV2(salt: Buffer): Buffer {
+  const material = getEncryptionKeyMaterial();
+  return Buffer.from(
+    crypto.hkdfSync(
+      "sha256",
+      Buffer.from(material, "utf8"),
+      salt,
+      Buffer.from("careeros-aes256-gcm-v2", "utf8"),
+      32
+    )
+  );
+}
+
+function deriveAesKeyV1Legacy(): Buffer {
+  const material = getEncryptionKeyMaterial();
+  const runtimeSecrets = getOrLoadRuntimeSecrets();
+  return crypto.scryptSync(material, runtimeSecrets.saltHex, 32);
+}
+
 /**
- * Encrypts sensitive OAuth tokens or secrets using AES-256-GCM with a random 96-bit IV
- * and 128-bit authentication tag. Stored format: v1:<iv_hex>:<authTag_hex>:<ciphertext_hex>
+ * Encrypts sensitive OAuth tokens or secrets using AES-256-GCM with a per-ciphertext
+ * 128-bit HKDF salt, 96-bit random IV, and 128-bit authentication tag.
+ * Stored format: v2:<salt_hex>:<iv_hex>:<authTag_hex>:<ciphertext_hex>
  */
 export function encryptSecret(plaintext: string): string {
-  const key = getDerivedEncryptionKey();
+  const salt = crypto.randomBytes(16);
+  const key = deriveAesKeyV2(salt);
   const iv = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv(ENCRYPTION_ALGORITHM, key, iv);
   const encrypted = Buffer.concat([
@@ -122,30 +164,51 @@ export function encryptSecret(plaintext: string): string {
     cipher.final(),
   ]);
   const authTag = cipher.getAuthTag();
-  return `v1:${iv.toString("hex")}:${authTag.toString("hex")}:${encrypted.toString("hex")}`;
+  return `v2:${salt.toString("hex")}:${iv.toString("hex")}:${authTag.toString(
+    "hex"
+  )}:${encrypted.toString("hex")}`;
 }
 
 /**
- * Decrypts an AES-256-GCM encrypted payload on the server side only.
+ * Decrypts an AES-256-GCM encrypted payload (v2 HKDF or legacy v1) on the server side only.
  */
 export function decryptSecret(encryptedPayload: string): string {
   const parts = encryptedPayload.split(":");
-  if (parts.length !== 4 || parts[0] !== "v1") {
-    throw new Error("Invalid encrypted token format");
-  }
-  const [, ivHex, authTagHex, ciphertextHex] = parts;
-  const key = getDerivedEncryptionKey();
-  const iv = Buffer.from(ivHex, "hex");
-  const authTag = Buffer.from(authTagHex, "hex");
-  const ciphertext = Buffer.from(ciphertextHex, "hex");
 
-  const decipher = crypto.createDecipheriv(ENCRYPTION_ALGORITHM, key, iv);
-  decipher.setAuthTag(authTag);
-  const decrypted = Buffer.concat([
-    decipher.update(ciphertext),
-    decipher.final(),
-  ]);
-  return decrypted.toString("utf8");
+  if (parts.length === 5 && parts[0] === "v2") {
+    const [, saltHex, ivHex, authTagHex, ciphertextHex] = parts;
+    const salt = Buffer.from(saltHex, "hex");
+    const iv = Buffer.from(ivHex, "hex");
+    const authTag = Buffer.from(authTagHex, "hex");
+    const ciphertext = Buffer.from(ciphertextHex, "hex");
+    const key = deriveAesKeyV2(salt);
+
+    const decipher = crypto.createDecipheriv(ENCRYPTION_ALGORITHM, key, iv);
+    decipher.setAuthTag(authTag);
+    const decrypted = Buffer.concat([
+      decipher.update(ciphertext),
+      decipher.final(),
+    ]);
+    return decrypted.toString("utf8");
+  }
+
+  if (parts.length === 4 && parts[0] === "v1") {
+    const [, ivHex, authTagHex, ciphertextHex] = parts;
+    const key = deriveAesKeyV1Legacy();
+    const iv = Buffer.from(ivHex, "hex");
+    const authTag = Buffer.from(authTagHex, "hex");
+    const ciphertext = Buffer.from(ciphertextHex, "hex");
+
+    const decipher = crypto.createDecipheriv(ENCRYPTION_ALGORITHM, key, iv);
+    decipher.setAuthTag(authTag);
+    const decrypted = Buffer.concat([
+      decipher.update(ciphertext),
+      decipher.final(),
+    ]);
+    return decrypted.toString("utf8");
+  }
+
+  throw new Error("Invalid encrypted token format");
 }
 
 /**
@@ -161,7 +224,9 @@ export function hashPassword(password: string): string {
  * Checks whether a master password has been configured in DB or environment.
  * Never falls back to a hardcoded password.
  */
-export function isMasterPasswordConfigured(storedHash?: string | null): boolean {
+export function isMasterPasswordConfigured(
+  storedHash?: string | null
+): boolean {
   if (storedHash && storedHash.startsWith("scrypt:")) {
     return true;
   }
@@ -239,7 +304,7 @@ export function deriveCsrfToken(sessionJti: string): string {
 }
 
 /**
- * Verifies an HMAC-SHA256 signed session token
+ * Verifies an HMAC-SHA256 signed session token and ensures it has not been revoked
  */
 export function verifySessionToken(
   token: string | undefined | null
@@ -277,6 +342,9 @@ export function verifySessionToken(
     ) {
       return null;
     }
+    if (isSessionJtiRevoked(parsed.jti)) {
+      return null;
+    }
     return parsed;
   } catch {
     return null;
@@ -296,14 +364,15 @@ export interface OAuthStatePayload {
 export function createOAuthStateToken(
   sessionJti: string,
   ttlSeconds = 600
-): { stateToken: string; nonce: string } {
+): { stateToken: string; nonce: string; expiresAt: string } {
   const now = Math.floor(Date.now() / 1000);
   const nonce = crypto.randomBytes(16).toString("hex");
+  const exp = now + ttlSeconds;
   const payload: OAuthStatePayload = {
     jti: sessionJti,
     nonce,
     iat: now,
-    exp: now + ttlSeconds,
+    exp,
   };
   const payloadB64 = Buffer.from(JSON.stringify(payload), "utf8").toString(
     "base64url"
@@ -315,6 +384,7 @@ export function createOAuthStateToken(
   return {
     stateToken: `${payloadB64}.${sig}`,
     nonce,
+    expiresAt: new Date(exp * 1000).toISOString(),
   };
 }
 
@@ -325,19 +395,19 @@ export function verifyOAuthStateToken(
   stateToken: string | undefined | null,
   expectedSessionJti: string,
   cookieNonce: string | undefined | null
-): boolean {
+): { valid: boolean; nonce: string | null } {
   if (
     !stateToken ||
     !expectedSessionJti ||
     !cookieNonce ||
     !stateToken.includes(".")
   ) {
-    return false;
+    return { valid: false, nonce: null };
   }
   const parts = stateToken.split(".");
-  if (parts.length !== 2) return false;
+  if (parts.length !== 2) return { valid: false, nonce: null };
   const [payloadB64, sig] = parts;
-  if (!payloadB64 || !sig) return false;
+  if (!payloadB64 || !sig) return { valid: false, nonce: null };
 
   const expectedSig = crypto
     .createHmac("sha256", getSessionSigningSecret())
@@ -350,7 +420,7 @@ export function verifyOAuthStateToken(
     sigBuf.length !== expectedBuf.length ||
     !crypto.timingSafeEqual(sigBuf, expectedBuf)
   ) {
-    return false;
+    return { valid: false, nonce: null };
   }
 
   try {
@@ -358,20 +428,25 @@ export function verifyOAuthStateToken(
       Buffer.from(payloadB64, "base64url").toString("utf8")
     ) as OAuthStatePayload;
     const now = Math.floor(Date.now() / 1000);
-    if (parsed.exp <= now) return false;
-    if (parsed.jti !== expectedSessionJti) return false;
+    if (parsed.exp <= now) return { valid: false, nonce: null };
+    if (parsed.jti !== expectedSessionJti) return { valid: false, nonce: null };
 
     const nonceA = Buffer.from(parsed.nonce);
     const nonceB = Buffer.from(cookieNonce);
-    if (nonceA.length !== nonceB.length) return false;
-    return crypto.timingSafeEqual(nonceA, nonceB);
+    if (
+      nonceA.length !== nonceB.length ||
+      !crypto.timingSafeEqual(nonceA, nonceB)
+    ) {
+      return { valid: false, nonce: null };
+    }
+    return { valid: true, nonce: parsed.nonce };
   } catch {
-    return false;
+    return { valid: false, nonce: null };
   }
 }
 
 /**
- * Hashes an API token (such as the Chrome Extension capture token) with SHA-256 for storage
+ * Hashes an API token or nonce with SHA-256 for storage
  */
 export function hashApiToken(rawToken: string): string {
   return crypto.createHash("sha256").update(rawToken).digest("hex");
@@ -395,29 +470,21 @@ export function verifyApiToken(
 }
 
 /**
- * Validates same-origin or CSRF token on state-changing HTTP methods (POST, PATCH, PUT, DELETE)
+ * Determines whether cookies should set the Secure attribute based on actual HTTPS transport.
+ * Ensures local `npm run start` over http://localhost:3000 remains functional while HTTPS sets Secure.
  */
-export function verifyCsrfProtection(
-  req: NextRequest,
-  session: SessionPayload
-): boolean {
-  const method = req.method.toUpperCase();
-  if (method === "GET" || method === "HEAD" || method === "OPTIONS") {
-    return true;
-  }
+export function isSecureCookieContext(req: NextRequest): boolean {
+  if (req.nextUrl.protocol === "https:") return true;
+  if (req.headers.get("x-forwarded-proto") === "https") return true;
+  const configuredUrl = process.env.NEXT_PUBLIC_APP_URL?.trim();
+  if (configuredUrl && configuredUrl.startsWith("https://")) return true;
+  return false;
+}
 
-  // 1. Check explicit session-bound CSRF token header if provided
-  const csrfHeader = req.headers.get("x-careeros-csrf");
-  if (csrfHeader) {
-    const expectedCsrf = deriveCsrfToken(session.jti);
-    const a = Buffer.from(csrfHeader);
-    const b = Buffer.from(expectedCsrf);
-    if (a.length === b.length && crypto.timingSafeEqual(a, b)) {
-      return true;
-    }
-  }
-
-  // 2. Check Origin / Referer header against allowed app origin
+/**
+ * Verifies Origin / Referer headers belong strictly to the CareerOS application origin
+ */
+export function verifySameOriginRequest(req: NextRequest): boolean {
   const originHeader = req.headers.get("origin");
   const refererHeader = req.headers.get("referer");
   const reqOrigin = req.nextUrl.origin;
@@ -438,17 +505,105 @@ export function verifyCsrfProtection(
     }
   }
 
-  // If neither Origin, Referer, nor X-CareerOS-CSRF is present on a mutation, block by default
   return false;
 }
 
 /**
+ * Validates same-origin AND session-bound CSRF token on state-changing HTTP methods.
+ * Immediately rejects any mismatched Origin/Referer header.
+ */
+export function verifyCsrfProtection(
+  req: NextRequest,
+  session: SessionPayload
+): boolean {
+  const method = req.method.toUpperCase();
+  if (method === "GET" || method === "HEAD" || method === "OPTIONS") {
+    return true;
+  }
+
+  // 1. If Origin or Referer is present, it MUST match our app origin (never bypassable)
+  const hasOriginOrReferer = Boolean(
+    req.headers.get("origin") || req.headers.get("referer")
+  );
+  if (hasOriginOrReferer && !verifySameOriginRequest(req)) {
+    return false;
+  }
+
+  // 2. Require explicit session-bound CSRF token header on cookie-authenticated mutations
+  const csrfHeader = req.headers.get("x-careeros-csrf");
+  if (!csrfHeader) {
+    return false;
+  }
+
+  const expectedCsrf = deriveCsrfToken(session.jti);
+  const a = Buffer.from(csrfHeader);
+  const b = Buffer.from(expectedCsrf);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+/**
+ * In-memory brute-force protection for single-user master password login
+ */
+const MAX_FAILED_LOGIN_ATTEMPTS = 5;
+const LOGIN_WINDOW_MS = 15 * 60 * 1000;
+
+function getLoginAttemptStore(): Map<
+  string,
+  { count: number; resetAt: number }
+> {
+  if (!globalForSecrets.__careerosLoginAttempts) {
+    globalForSecrets.__careerosLoginAttempts = new Map();
+  }
+  return globalForSecrets.__careerosLoginAttempts;
+}
+
+export function getClientRateLimitKey(req: NextRequest): string {
+  const fwd = req.headers.get("x-forwarded-for")?.split(",")[0]?.trim();
+  const realIp = req.headers.get("x-real-ip")?.trim();
+  return fwd || realIp || "local-owner";
+}
+
+export function checkLoginRateLimit(key: string): {
+  allowed: boolean;
+  retryAfterSeconds: number;
+} {
+  const store = getLoginAttemptStore();
+  const entry = store.get(key);
+  const now = Date.now();
+  if (!entry || entry.resetAt <= now) {
+    return { allowed: true, retryAfterSeconds: 0 };
+  }
+  if (entry.count >= MAX_FAILED_LOGIN_ATTEMPTS) {
+    return {
+      allowed: false,
+      retryAfterSeconds: Math.ceil((entry.resetAt - now) / 1000),
+    };
+  }
+  return { allowed: true, retryAfterSeconds: 0 };
+}
+
+export function recordFailedLoginAttempt(key: string): void {
+  const store = getLoginAttemptStore();
+  const now = Date.now();
+  const entry = store.get(key);
+  if (!entry || entry.resetAt <= now) {
+    store.set(key, { count: 1, resetAt: now + LOGIN_WINDOW_MS });
+  } else {
+    entry.count += 1;
+    store.set(key, entry);
+  }
+}
+
+export function clearFailedLoginAttempts(key: string): void {
+  getLoginAttemptStore().delete(key);
+}
+
+/**
  * Enforces server-side authentication (and CSRF protection on mutations) for private API routes.
- * Returns { session } if authorized, or { response: NextResponse(401/403) } if unauthorized.
  */
 export function requireAuthenticatedSession(req: NextRequest): {
   session: SessionPayload | null;
-  errorResponse: NextResponse | null;
+  errorResponse: Response | null;
 } {
   const token = req.cookies.get(SESSION_COOKIE_NAME)?.value;
   const session = verifySessionToken(token);
@@ -456,7 +611,7 @@ export function requireAuthenticatedSession(req: NextRequest): {
   if (!session) {
     return {
       session: null,
-      errorResponse: NextResponse.json(
+      errorResponse: Response.json(
         { error: "Authentication required. Please log in to CareerOS." },
         { status: 401 }
       ),
@@ -466,7 +621,7 @@ export function requireAuthenticatedSession(req: NextRequest): {
   if (!verifyCsrfProtection(req, session)) {
     return {
       session: null,
-      errorResponse: NextResponse.json(
+      errorResponse: Response.json(
         { error: "CSRF validation failed for mutation request." },
         { status: 403 }
       ),
@@ -477,22 +632,33 @@ export function requireAuthenticatedSession(req: NextRequest): {
 }
 
 /**
- * Builds strict, non-wildcard CORS headers for the Chrome Extension endpoint.
+ * Checks whether the request's Origin (if present) is explicitly permitted for the extension API.
  */
-export function getExtensionCorsHeaders(
-  req: NextRequest
-): Record<string, string> {
-  const origin = req.headers.get("origin") || "";
+export function isOriginAllowedForExtension(req: NextRequest): boolean {
+  const origin = req.headers.get("origin");
+  if (!origin) return true; // Non-browser / direct extension contexts without Origin header
+
   const appOrigin = process.env.NEXT_PUBLIC_APP_URL
     ? new URL(process.env.NEXT_PUBLIC_APP_URL).origin
     : req.nextUrl.origin;
   const allowedExtensionOrigin =
     process.env.CAREEROS_ALLOWED_EXTENSION_ORIGIN?.trim() || "";
 
-  const isAllowedOrigin =
+  return (
     origin === appOrigin ||
     origin === req.nextUrl.origin ||
-    (allowedExtensionOrigin !== "" && origin === allowedExtensionOrigin);
+    (allowedExtensionOrigin !== "" && origin === allowedExtensionOrigin)
+  );
+}
+
+/**
+ * Builds strict, non-wildcard CORS headers for the Chrome Extension endpoint.
+ */
+export function getExtensionCorsHeaders(
+  req: NextRequest
+): Record<string, string> {
+  const origin = req.headers.get("origin") || "";
+  const isAllowedOrigin = origin !== "" && isOriginAllowedForExtension(req);
 
   const headers: Record<string, string> = {
     "Access-Control-Allow-Methods": "POST, OPTIONS",
@@ -501,7 +667,7 @@ export function getExtensionCorsHeaders(
     Vary: "Origin",
   };
 
-  if (isAllowedOrigin && origin) {
+  if (isAllowedOrigin) {
     headers["Access-Control-Allow-Origin"] = origin;
   }
 

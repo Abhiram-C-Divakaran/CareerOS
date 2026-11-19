@@ -1,15 +1,18 @@
 import { NextRequest, NextResponse } from "next/server";
 import {
   createOrDeduplicateApplication,
+  getDb,
   getExtensionTokenHash,
 } from "@/lib/db";
 import { detectPortalFromText, extractApplicationId } from "@/lib/email-parser";
 import {
   getExtensionCorsHeaders,
+  isOriginAllowedForExtension,
   requireAuthenticatedSession,
   verifyApiToken,
 } from "@/lib/security";
 import {
+  safeParseJsonBody,
   validateApplicationPortal,
   validateApplicationStatus,
   validateOptionalString,
@@ -20,11 +23,22 @@ import {
 
 export async function OPTIONS(req: NextRequest) {
   const corsHeaders = getExtensionCorsHeaders(req);
+  if (!isOriginAllowedForExtension(req)) {
+    return new NextResponse(null, { status: 403, headers: corsHeaders });
+  }
   return new NextResponse(null, { status: 204, headers: corsHeaders });
 }
 
 export async function POST(req: NextRequest) {
+  getDb();
   const corsHeaders = getExtensionCorsHeaders(req);
+
+  if (!isOriginAllowedForExtension(req)) {
+    return NextResponse.json(
+      { error: "Origin not allowed for Chrome Extension capture API." },
+      { status: 403, headers: corsHeaders }
+    );
+  }
 
   // Authenticate via either Extension API Token OR active browser session + CSRF check
   const extHeaderToken =
@@ -33,10 +47,15 @@ export async function POST(req: NextRequest) {
       ? req.headers.get("authorization")!.slice(7)
       : null);
 
-  const storedExtHash = getExtensionTokenHash();
-  const isValidExtToken = verifyApiToken(extHeaderToken, storedExtHash);
-
-  if (!isValidExtToken) {
+  if (extHeaderToken !== null) {
+    const storedExtHash = getExtensionTokenHash();
+    if (!verifyApiToken(extHeaderToken, storedExtHash)) {
+      return NextResponse.json(
+        { error: "Invalid Chrome Extension API token." },
+        { status: 401, headers: corsHeaders }
+      );
+    }
+  } else {
     const { errorResponse } = requireAuthenticatedSession(req);
     if (errorResponse) {
       return NextResponse.json(
@@ -50,7 +69,7 @@ export async function POST(req: NextRequest) {
   }
 
   try {
-    const body = (await req.json()) as Record<string, unknown>;
+    const body = await safeParseJsonBody(req);
 
     const pageTextSnippet =
       validateOptionalString(body.pageTextSnippet, "pageTextSnippet", 6000) ||

@@ -1,13 +1,17 @@
 import { NextRequest, NextResponse } from "next/server";
 import {
   createOrDeduplicateApplication,
+  deleteApplicationRecord,
+  getDb,
   listApplications,
   updateApplicationStatusAndFields,
 } from "@/lib/db";
 import { requireAuthenticatedSession } from "@/lib/security";
 import {
+  safeParseJsonBody,
   validateApplicationPortal,
   validateApplicationStatus,
+  validateOptionalEmail,
   validateOptionalIsoDate,
   validateOptionalString,
   validatePriority,
@@ -18,6 +22,7 @@ import {
 } from "@/lib/validation";
 
 export async function GET(req: NextRequest) {
+  getDb();
   const { errorResponse } = requireAuthenticatedSession(req);
   if (errorResponse) return errorResponse;
 
@@ -53,11 +58,12 @@ export async function GET(req: NextRequest) {
 }
 
 export async function POST(req: NextRequest) {
+  getDb();
   const { errorResponse } = requireAuthenticatedSession(req);
   if (errorResponse) return errorResponse;
 
   try {
-    const body = (await req.json()) as Record<string, unknown>;
+    const body = await safeParseJsonBody(req);
 
     const company = validateRequiredString(body.company, "company", 140);
     const role = validateRequiredString(body.role, "role", 160);
@@ -93,10 +99,9 @@ export async function POST(req: NextRequest) {
       body.followUpDate,
       "followUpDate"
     );
-    const recruiterEmail = validateOptionalString(
+    const recruiterEmail = validateOptionalEmail(
       body.recruiterEmail,
-      "recruiterEmail",
-      160
+      "recruiterEmail"
     );
     const notes = validateOptionalString(body.notes, "notes", 2000);
 
@@ -137,11 +142,12 @@ export async function POST(req: NextRequest) {
 }
 
 export async function PATCH(req: NextRequest) {
+  getDb();
   const { errorResponse } = requireAuthenticatedSession(req);
   if (errorResponse) return errorResponse;
 
   try {
-    const body = (await req.json()) as Record<string, unknown>;
+    const body = await safeParseJsonBody(req);
     const id = validateRequiredString(body.id, "id", 80);
 
     const status =
@@ -186,7 +192,7 @@ export async function PATCH(req: NextRequest) {
         : undefined;
     const recruiterEmail =
       body.recruiterEmail !== undefined
-        ? validateOptionalString(body.recruiterEmail, "recruiterEmail", 160)
+        ? validateOptionalEmail(body.recruiterEmail, "recruiterEmail")
         : undefined;
     const notes =
       body.notes !== undefined
@@ -231,6 +237,38 @@ export async function PATCH(req: NextRequest) {
       {
         error:
           err instanceof Error ? err.message : "Failed to update application",
+      },
+      { status: 500 }
+    );
+  }
+}
+
+export async function DELETE(req: NextRequest) {
+  getDb();
+  const { errorResponse } = requireAuthenticatedSession(req);
+  if (errorResponse) return errorResponse;
+
+  try {
+    const { searchParams } = new URL(req.url);
+    const id = validateRequiredString(searchParams.get("id"), "id", 80);
+    const deleted = deleteApplicationRecord(id, "MANUAL");
+
+    if (!deleted) {
+      return NextResponse.json(
+        { error: "Application not found" },
+        { status: 404 }
+      );
+    }
+
+    return NextResponse.json({ ok: true, deletedId: id });
+  } catch (err) {
+    if (err instanceof ValidationError) {
+      return NextResponse.json({ error: err.message }, { status: 400 });
+    }
+    return NextResponse.json(
+      {
+        error:
+          err instanceof Error ? err.message : "Failed to delete application",
       },
       { status: 500 }
     );

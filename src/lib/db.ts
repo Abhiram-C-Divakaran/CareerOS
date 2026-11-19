@@ -20,6 +20,7 @@ import {
   encryptSecret,
   hashApiToken,
   hashPassword,
+  registerSessionRevocationChecker,
 } from "./security.ts";
 
 // Load Node 24's built-in node:sqlite via process.getBuiltinModule
@@ -70,6 +71,7 @@ export function getDb(): SqliteDb {
   globalForDb.__careerosDb = db;
   globalForDb.__careerosDbPath = targetPath;
 
+  registerSessionRevocationChecker(isSessionRevoked);
   seedInitialDataIfEmpty(db);
   return db;
 }
@@ -214,6 +216,19 @@ function initializeSchema(db: SqliteDb): void {
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL,
       updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS revoked_sessions (
+      jti TEXT PRIMARY KEY,
+      revoked_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS oauth_states (
+      nonce_hash TEXT PRIMARY KEY,
+      session_jti TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      created_at TEXT NOT NULL
     );
   `);
 
@@ -764,6 +779,32 @@ export function updateApplicationStatusAndFields(
   return getApplicationById(id);
 }
 
+export function deleteApplicationRecord(
+  id: string,
+  source: EventSource = "MANUAL"
+): boolean {
+  const db = getDb();
+  const current = getApplicationById(id);
+  if (!current) return false;
+
+  const now = new Date().toISOString();
+  appendImmutableTimelineEvent(db, {
+    applicationId: id,
+    company: current.company,
+    role: current.role,
+    eventType: "STATUS_CHANGED",
+    previousStatus: current.status,
+    newStatus: "WITHDRAWN",
+    title: `Application deleted from active tracker (${current.company})`,
+    description: `Active record removed via ${source}; immutable historical timeline preserved.`,
+    source,
+    eventTimestamp: now,
+  });
+
+  const res = db.prepare(`DELETE FROM applications WHERE id = ?`).run(id);
+  return res.changes > 0;
+}
+
 export function listTimelineEvents(filters?: {
   applicationId?: string;
   source?: string;
@@ -838,6 +879,7 @@ export function createOrUpdateInterview(input: {
   prepNotes?: string | null;
   reminderMinutesBefore?: number;
   source?: EventSource;
+  isSample?: boolean;
 }): { interview: InterviewEvent; created: boolean } {
   const db = getDb();
   const now = new Date().toISOString();
@@ -857,6 +899,7 @@ export function createOrUpdateInterview(input: {
     const found = findExistingApplication(db, {
       company: input.company,
       role: input.role,
+      includeSample: input.isSample,
     });
     if (found) matchedAppId = found.id;
   }
@@ -870,8 +913,8 @@ export function createOrUpdateInterview(input: {
     `INSERT INTO interviews (
       id, application_id, company, role, round_name, scheduled_start, scheduled_end,
       meeting_link, organizer_email, calendar_event_id, prep_notes,
-      reminder_minutes_before, reminder_dismissed, status, source, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'UPCOMING', ?, ?)`
+      reminder_minutes_before, reminder_dismissed, status, source, is_sample, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'UPCOMING', ?, ?, ?)`
   ).run(
     id,
     matchedAppId,
@@ -886,6 +929,7 @@ export function createOrUpdateInterview(input: {
     input.prepNotes || null,
     input.reminderMinutesBefore ?? 30,
     source,
+    input.isSample ? 1 : 0,
     now
   );
 
@@ -920,10 +964,29 @@ export function createOrUpdateInterview(input: {
   return { interview: mapRowToInterview(row), created: true };
 }
 
+const STATUS_STAGE_RANK: Record<ApplicationStatus, number> = {
+  APPLIED: 1,
+  UNDER_REVIEW: 2,
+  ASSESSMENT: 3,
+  INTERVIEW: 4,
+  OFFER: 5,
+  REJECTED: 5,
+  WITHDRAWN: 5,
+};
+
+export function hasSyncedEmail(gmailMessageId: string): boolean {
+  const db = getDb();
+  const row = db
+    .prepare(`SELECT 1 FROM synced_emails WHERE gmail_message_id = ? LIMIT 1`)
+    .get(gmailMessageId);
+  return Boolean(row);
+}
+
 export function ingestEmailMessage(raw: RawEmailInput): {
-  record: SyncedEmailRecord;
+  record: SyncedEmailRecord | null;
   deduplicatedMessage: boolean;
   deduplicatedApplication: boolean;
+  skippedNonJob?: boolean;
   application: JobApplication | null;
 } {
   const db = getDb();
@@ -944,6 +1007,15 @@ export function ingestEmailMessage(raw: RawEmailInput): {
   }
 
   const parsed = parseJobEmail(raw);
+  if (!parsed.isJobRelated) {
+    return {
+      record: null,
+      deduplicatedMessage: false,
+      deduplicatedApplication: false,
+      skippedNonJob: true,
+      application: null,
+    };
+  }
   const now = new Date().toISOString();
 
   // 2. Match or create application with deduplication
@@ -960,8 +1032,23 @@ export function ingestEmailMessage(raw: RawEmailInput): {
   if (existingApp) {
     deduplicatedApplication = true;
     const prevStatus = existingApp.status;
-    // Determine if status should update
-    const nextStatus = parsed.mappedStatus;
+    // Prevent older paginated messages from downgrading newer funnel stages
+    const incomingTimeMs = Date.parse(raw.receivedAt || now);
+    const existingTimeMs = Date.parse(existingApp.lastActivityDate);
+    const shouldAdvanceStatus =
+      STATUS_STAGE_RANK[parsed.mappedStatus] >= STATUS_STAGE_RANK[prevStatus] ||
+      (!Number.isNaN(incomingTimeMs) &&
+        !Number.isNaN(existingTimeMs) &&
+        incomingTimeMs > existingTimeMs &&
+        prevStatus !== "OFFER");
+
+    const nextStatus = shouldAdvanceStatus ? parsed.mappedStatus : prevStatus;
+    const latestActivityDate =
+      !Number.isNaN(incomingTimeMs) &&
+      !Number.isNaN(existingTimeMs) &&
+      incomingTimeMs > existingTimeMs
+        ? raw.receivedAt || now
+        : existingApp.lastActivityDate;
     const nextAssessmentDeadline =
       parsed.classification === "ASSESSMENT" && parsed.extractedDeadline
         ? parsed.extractedDeadline
@@ -985,7 +1072,7 @@ export function ingestEmailMessage(raw: RawEmailInput): {
       parsed.applicationId,
       nextAssessmentDeadline,
       nextInterviewAt,
-      raw.receivedAt || now,
+      latestActivityDate,
       now,
       existingApp.id
     );
@@ -1056,6 +1143,7 @@ export function ingestEmailMessage(raw: RawEmailInput): {
       organizerEmail: raw.sender,
       calendarEventId: `gmail_int_${raw.messageId}`,
       source: "GMAIL_SYNC",
+      isSample: raw.isSample,
     });
   }
 
@@ -1168,22 +1256,32 @@ export function getDecryptedGoogleTokens(): {
     .get();
   if (!row) return null;
 
-  return {
-    accountEmail: row.account_email ? String(row.account_email) : null,
-    accessToken: decryptSecret(String(row.encrypted_access_token)),
-    refreshToken: row.encrypted_refresh_token
-      ? decryptSecret(String(row.encrypted_refresh_token))
-      : null,
-    tokenExpiresAt: row.token_expires_at ? String(row.token_expires_at) : null,
-    tokenStatus:
-      (row.token_status as "VALID" | "EXPIRED" | "REVOKED") || "VALID",
-    lastGmailSyncAt: row.last_gmail_sync_at
-      ? String(row.last_gmail_sync_at)
-      : null,
-    lastCalendarSyncAt: row.last_calendar_sync_at
-      ? String(row.last_calendar_sync_at)
-      : null,
-  };
+  try {
+    return {
+      accountEmail: row.account_email ? String(row.account_email) : null,
+      accessToken: decryptSecret(String(row.encrypted_access_token)),
+      refreshToken: row.encrypted_refresh_token
+        ? decryptSecret(String(row.encrypted_refresh_token))
+        : null,
+      tokenExpiresAt: row.token_expires_at ? String(row.token_expires_at) : null,
+      tokenStatus:
+        (row.token_status as "VALID" | "EXPIRED" | "REVOKED") || "VALID",
+      lastGmailSyncAt: row.last_gmail_sync_at
+        ? String(row.last_gmail_sync_at)
+        : null,
+      lastCalendarSyncAt: row.last_calendar_sync_at
+        ? String(row.last_calendar_sync_at)
+        : null,
+    };
+  } catch {
+    recordOAuthSyncError(
+      "Stored Google OAuth token could not be decrypted (key changed or corrupted). Please reconnect your Google account.",
+      "REVOKED"
+    );
+    throw new Error(
+      "Stored Google OAuth token is invalid or corrupted. Please reconnect your Google account."
+    );
+  }
 }
 
 export function getOAuthIntegrationStatus(): OAuthIntegrationStatus {
@@ -1323,6 +1421,58 @@ export function rotateExtensionApiToken(): string {
      ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
   ).run(tokenHash, now);
   return rawToken;
+}
+
+export function revokeSessionJti(jti: string, expSeconds: number): void {
+  const db = getDb();
+  const nowIso = new Date().toISOString();
+  const expIso = new Date(expSeconds * 1000).toISOString();
+  db.prepare(`DELETE FROM revoked_sessions WHERE expires_at <= ?`).run(nowIso);
+  db.prepare(
+    `INSERT OR REPLACE INTO revoked_sessions (jti, revoked_at, expires_at) VALUES (?, ?, ?)`
+  ).run(jti, nowIso, expIso);
+}
+
+export function isSessionRevoked(jti: string): boolean {
+  const db = getDb();
+  const row = db
+    .prepare(`SELECT 1 FROM revoked_sessions WHERE jti = ? LIMIT 1`)
+    .get(jti);
+  return Boolean(row);
+}
+
+export function storeOAuthStateNonce(
+  nonce: string,
+  sessionJti: string,
+  expiresAt: string
+): void {
+  const db = getDb();
+  const nowIso = new Date().toISOString();
+  const nonceHash = hashApiToken(nonce);
+  db.prepare(`DELETE FROM oauth_states WHERE expires_at <= ?`).run(nowIso);
+  db.prepare(
+    `INSERT OR REPLACE INTO oauth_states (nonce_hash, session_jti, expires_at, created_at) VALUES (?, ?, ?, ?)`
+  ).run(nonceHash, sessionJti, expiresAt, nowIso);
+}
+
+/**
+ * Atomically consumes a single-use OAuth state nonce bound to sessionJti.
+ * Returns true ONLY on the first valid consumption before expiry.
+ */
+export function consumeOAuthStateNonce(
+  nonce: string,
+  sessionJti: string
+): boolean {
+  const db = getDb();
+  const nowIso = new Date().toISOString();
+  const nonceHash = hashApiToken(nonce);
+  db.prepare(`DELETE FROM oauth_states WHERE expires_at <= ?`).run(nowIso);
+  const res = db
+    .prepare(
+      `DELETE FROM oauth_states WHERE nonce_hash = ? AND session_jti = ? AND expires_at > ?`
+    )
+    .run(nonceHash, sessionJti, nowIso);
+  return res.changes > 0;
 }
 
 export function generateDailyBriefing(): DailyBriefing {

@@ -1,6 +1,7 @@
 import {
   createOrUpdateInterview,
   getDecryptedGoogleTokens,
+  hasSyncedEmail,
   ingestEmailMessage,
   recordOAuthSyncError,
   recordSyncTimestamp,
@@ -281,6 +282,7 @@ export async function syncLiveGmailMessages(options?: {
   processedCount: number;
   newApplications: number;
   deduplicatedCount: number;
+  skippedNonJobCount: number;
   incrementalSince: string | null;
   syncedAt: string;
 }> {
@@ -311,6 +313,7 @@ export async function syncLiveGmailMessages(options?: {
   let processedCount = 0;
   let newApplications = 0;
   let deduplicatedCount = 0;
+  let skippedNonJobCount = 0;
 
   try {
     do {
@@ -354,6 +357,13 @@ export async function syncLiveGmailMessages(options?: {
 
       for (const item of messages) {
         if (!item.id) continue;
+
+        // Pre-fetch deduplication by preserved Gmail message ID (saves API quota on repeat syncs)
+        if (hasSyncedEmail(item.id)) {
+          processedCount++;
+          deduplicatedCount++;
+          continue;
+        }
 
         const msgRes = await fetch(
           `https://gmail.googleapis.com/gmail/v1/users/me/messages/${encodeURIComponent(
@@ -402,7 +412,12 @@ export async function syncLiveGmailMessages(options?: {
         });
 
         processedCount++;
-        if (result.deduplicatedMessage || result.deduplicatedApplication) {
+        if (result.skippedNonJob) {
+          skippedNonJobCount++;
+        } else if (
+          result.deduplicatedMessage ||
+          result.deduplicatedApplication
+        ) {
           deduplicatedCount++;
         } else {
           newApplications++;
@@ -421,6 +436,7 @@ export async function syncLiveGmailMessages(options?: {
       processedCount,
       newApplications,
       deduplicatedCount,
+      skippedNonJobCount,
       incrementalSince,
       syncedAt,
     };

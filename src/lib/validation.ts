@@ -1,3 +1,4 @@
+import type { NextRequest } from "next/server";
 import type {
   ApplicationPortal,
   ApplicationStatus,
@@ -58,6 +59,21 @@ export class ValidationError extends Error {
   }
 }
 
+export async function safeParseJsonBody(
+  req: NextRequest
+): Promise<Record<string, unknown>> {
+  try {
+    const parsed = await req.json();
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new ValidationError("Request body must be a JSON object.");
+    }
+    return parsed as Record<string, unknown>;
+  } catch (err) {
+    if (err instanceof ValidationError) throw err;
+    throw new ValidationError("Request body must contain valid JSON.");
+  }
+}
+
 export function validateApplicationStatus(
   status: unknown,
   fieldName = "status"
@@ -86,6 +102,21 @@ export function validateApplicationPortal(
     );
   }
   return portal as ApplicationPortal;
+}
+
+export function validateEventSource(
+  source: unknown,
+  fieldName = "source"
+): EventSource {
+  if (
+    typeof source !== "string" ||
+    !ALLOWED_EVENT_SOURCES.includes(source as EventSource)
+  ) {
+    throw new ValidationError(
+      `Invalid ${fieldName}. Allowed values: ${ALLOWED_EVENT_SOURCES.join(", ")}`
+    );
+  }
+  return source as EventSource;
 }
 
 export function validatePriority(priority: unknown): PriorityLevel {
@@ -139,7 +170,9 @@ export function validateRequiredString(
   maxLength = 200
 ): string {
   if (typeof val !== "string" || val.trim().length === 0) {
-    throw new ValidationError(`${fieldName} is required and must be a non-empty string.`);
+    throw new ValidationError(
+      `${fieldName} is required and must be a non-empty string.`
+    );
   }
   const trimmed = val.trim();
   if (trimmed.length > maxLength) {
@@ -167,6 +200,20 @@ export function validateOptionalString(
     );
   }
   return trimmed;
+}
+
+export function validateOptionalEmail(
+  val: unknown,
+  fieldName = "email"
+): string | null {
+  const str = validateOptionalString(val, fieldName, 200);
+  if (!str) return null;
+  // Allow either plain email or "Display Name <email@domain>"
+  const emailOnly = str.match(/<([^>]+)>/)?.[1] || str;
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailOnly.trim())) {
+    throw new ValidationError(`${fieldName} must be a valid email address.`);
+  }
+  return str;
 }
 
 /**
@@ -212,4 +259,16 @@ export function validateOptionalIsoDate(
     throw new ValidationError(`${fieldName} is not a valid date.`);
   }
   return new Date(ms).toISOString();
+}
+
+/**
+ * Escapes CSV values and mitigates Excel/Sheets formula injection (CWE-1236)
+ */
+export function escapeSafeCsvCell(val: string | null | undefined): string {
+  if (val === null || val === undefined) return '""';
+  let str = String(val);
+  if (/^[=+\-@\t\r]/.test(str)) {
+    str = `'${str}`;
+  }
+  return `"${str.replace(/"/g, '""')}"`;
 }
